@@ -1,0 +1,4 @@
+# Windows x64, Python 3.10+; tkinter comes from the Python installation.
+capstone==5.0.9
+pefile==2024.8.26
+tomli==2.2.1; python_version < "3.11"
