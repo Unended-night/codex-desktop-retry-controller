@@ -4,11 +4,46 @@ from pathlib import Path
 import struct
 import sys
 import unittest
+from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'research/.deps'))
 import capstone
-from controller.native_v4 import classifier, outer, replacements, safe_ranges
+from controller.native import _mapped_va
+from controller.native_v4 import classifier, http_budget, outer, replacements, responses_transport, safe_ranges
+from controller import native
+
+
+class AnalysisCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.key = patch.object(native, '_analysis_key', None)
+        self.result = patch.object(native, '_analysis_result', None)
+        self.key.start()
+        self.result.start()
+        self.addCleanup(self.key.stop)
+        self.addCleanup(self.result.stop)
+
+    def test_identical_content_reuses_analysis_without_retaining_caller_mutations(self):
+        with patch.object(native, '_locate', return_value={'offsets': {'http': 7}}) as analyze:
+            first = native.locate(b'original', ValueError)
+            first['offsets']['http'] = 99
+            second = native.locate(bytes(bytearray(b'original')), RuntimeError)
+        self.assertEqual(second, {'offsets': {'http': 7}})
+        self.assertEqual(analyze.call_count, 1)
+
+    def test_changed_bytes_are_reanalyzed_even_at_the_same_size(self):
+        with patch.object(native, '_locate', side_effect=[{'http': 7}, {'http': 8}]) as analyze:
+            self.assertEqual(native.locate(b'original', ValueError), {'http': 7})
+            self.assertEqual(native.locate(b'originaL', ValueError), {'http': 8})
+        self.assertEqual(analyze.call_count, 2)
+
+    def test_failed_analysis_is_not_cached_or_replaced_with_previous_success(self):
+        with patch.object(native, '_locate', side_effect=[{'http': 7}, ValueError('changed structure'), {'http': 8}]) as analyze:
+            native.locate(b'original', ValueError)
+            with self.assertRaisesRegex(ValueError, 'changed structure'):
+                native.locate(b'changed!', ValueError)
+            self.assertEqual(native.locate(b'changed!', ValueError), {'http': 8})
+        self.assertEqual(analyze.call_count, 3)
 
 
 class OutlinedTests(unittest.TestCase):
@@ -20,6 +55,18 @@ class OutlinedTests(unittest.TestCase):
         cs=capstone.Cs(capstone.CS_ARCH_X86,capstone.CS_MODE_64)
         cs.detail=True
         return list(cs.disasm(data,address))
+
+    def test_unmapped_pe_offsets_are_rejected_as_structure_mismatches(self):
+        class PE:
+            def __init__(self, rva):
+                self.rva=rva
+
+            def get_rva_from_offset(self, offset):
+                return self.rva
+
+        self.assertEqual(_mapped_va(PE(0x1234),0x140000000,0x80),0x140001234)
+        with self.assertRaisesRegex(ValueError,'outside mapped PE sections'):
+            _mapped_va(PE(None),0x140000000,0x80)
 
     def layout(self,shift=0,mutate=None):
         f=self.fixture
@@ -93,6 +140,211 @@ class OutlinedTests(unittest.TestCase):
         branch=b'\xe9'+struct.pack('<i',s['connection']+10-start-5)
         with self.assertRaisesRegex(ValueError,'branch into'):
             safe_ranges(self.decode(branch,start)+ins,[(s['connection'],s['bounded'])],data,off)
+
+    def helper(self, fallback=14, mask=0x123456789ab):
+        # Synthetic classifier; enum fallback and terminal mask are inputs.
+        return (bytes.fromhex('4883ec384889d0488b1149b900000000000000804931d1')
+                + bytes.fromhex('4885d241b8') + struct.pack('<I',fallback)
+                + bytes.fromhex('4d0f48c1ba00ca9a3b49b9') + struct.pack('<Q',mask)
+                + bytes.fromhex('4d0fa3c173054883c438c390'))
+
+    def test_classifier_accepts_changed_enum_and_register_allocation(self):
+        for fallback in (0,13,14,63):
+            for mask in (0x123456789ab,0xabcdef123456):
+                with self.subTest(fallback=fallback,mask=mask):
+                    data=self.helper(fallback,mask)
+                    prefix=classifier(self.decode(data,0x1000))
+                    self.assertIn(struct.pack('<Q',mask),prefix)
+
+    def test_classifier_rejects_unproven_tag_flags_mask_and_sentinel(self):
+        raw=self.helper()
+        changes=[('4885d2','4885c0'),  # Sign flags from attempt instead of tag.
+                 ('4d0f48c1','4d0f48c0'),  # Selects its fallback, not untagged error.
+                 ('4d0fa3c1','4d0fa3c0'),  # BT operand is not the mask.
+                 ('ba00ca9a3b','ba01ca9a3b'),
+                 ('488b11','488b12'),  # Wrong pointer provenance.
+                 ('4931d1','4131d1'),  # Truncates the tag normalization.
+                 ('41b80e000000','41b840000000'),  # Out-of-range fallback.
+                 ('488b11','65488b11')]
+        for before,after in changes:
+            with self.subTest(change=after), self.assertRaises(ValueError):
+                classifier(self.decode(raw.replace(bytes.fromhex(before),bytes.fromhex(after),1),0x1000))
+
+    def http_fragment(self, indirect=True):
+        # Small invented state layout, branch destinations and call target.
+        tag='498d5720488b1a' if indirect else '498b5f20'
+        return bytes.fromhex(tag+'4883fb0c7400'
+            '498b7f10493b7f087300'  # Counter, budget, exhausted.
+            '4889d94883e904b801000000480f43c18d48fd83f9037300'
+            'e80000000048ffc749897f30c3')
+
+    def http_layout(self, raw=None, address=0x2000):
+        data=bytearray(raw if raw is not None else self.http_fragment())
+        ins=self.decode(data,address)
+        compare=next(n for n,i in enumerate(ins) if i.mnemonic=='cmp' and i.operands[1].type==3)
+        # All synthetic conditional exits target the final RET.
+        for i in ins:
+            if i.mnemonic in ('je','jae'):
+                data[i.address-address+i.size-1]=ins[-1].address-i.address-i.size
+        ins=self.decode(data,address)
+        off=lambda va:va-address
+        return http_budget(ins,compare,data,off),ins,data,off
+
+    def test_http_gate_accepts_direct_indirect_and_relocated_state(self):
+        for indirect in (False,True):
+            raw=self.http_fragment(indirect)
+            for address in (0x2000,0x12342000):
+                with self.subTest(indirect=indirect,address=address):
+                    result,ins,_,_=self.http_layout(raw,address)
+                    cmp=next(i for i in ins if i.address==result['http'])
+                    self.assertEqual(result['http_size'],cmp.size)
+                    # Moving every state field together preserves their relation.
+                    shifted=bytearray(raw)
+                    for i in self.decode(raw,address):
+                        if i.disp_size and any(o.type==3 and i.reg_name(o.mem.base)=='r15' for o in i.operands):
+                            shifted[i.address-address+i.disp_offset]+=0x10
+                    self.assertEqual(result,self.http_layout(shifted,address)[0])
+
+    def test_http_gate_accepts_register_reallocation(self):
+        raw=self.http_fragment(False)
+        variants=[raw.replace(bytes.fromhex('4889d94883e904b801000000480f43c18d48fd83f903'),
+                              bytes.fromhex('4989d84983e804ba01000000490f43d08d4afd83f903')),
+                  raw.replace(bytes.fromhex('b801000000480f43c18d48fd'),
+                              bytes.fromhex('be01000000480f43f18d4efd')),
+                  raw.replace(bytes.fromhex('498b7f10493b7f08'),bytes.fromhex('498b7710493b7708'))
+                     .replace(bytes.fromhex('48ffc749897f30'),bytes.fromhex('48ffc649897730')),
+                  raw.replace(bytes.fromhex('498b5f20'),bytes.fromhex('498b5e20'))
+                     .replace(bytes.fromhex('498b7f10493b7f08'),bytes.fromhex('498b7e10493b7e08'))
+                     .replace(bytes.fromhex('49897f30'),bytes.fromhex('49897e30'))]
+        for raw in variants:
+            self.http_layout(raw)
+
+    def test_http_gate_rejects_alias_clobbers_and_mismatched_fields(self):
+        raw=self.http_fragment()
+        changes=[('4889d9','4989df'),  # Normalization overwrites state.
+                 ('4889d9','4889df'),  # Normalization overwrites counter.
+                 ('b801000000480f43c18d48fd','bf01000000480f43f98d4ffd'),  # EDI alias.
+                 ('8d48fd83f903','418d7ffd83ff03'),  # Range temp aliases counter.
+                 ('4883fb0c','31db'),  # EBX invalidates the loaded error tag.
+                 ('4883fb0c','4531ff'),  # R15D invalidates state provenance.
+                 ('4883fb0c','41b701'),  # R15B also invalidates state.
+                 ('498d5720','498d5710'),  # Tag overlaps attempt.
+                 ('498d5720','498d570c'),  # Partial overlap with budget/attempt.
+                 ('493b7f08','493b7f10'),  # Budget equals attempt.
+                 ('493b7f08','65493b7f08'),  # Segment-based memory access.
+                 ('488b1a','65488b1a'),
+                 ('488b1a','488b1c0a'),  # Indexed tag load.
+                 ('498d5720','498d5620'),  # Tag from different state.
+                 ('49897f30','49897e30'),  # Store to different state.
+                 ('49897f30','49897f24'),  # Next attempt overlaps tag.
+                 ('48ffc7','31ff48ffc7'),  # EDI clobber before increment.
+                 ('48ffc7','4531ff48ffc7'),  # R15D clobber before increment.
+                 ('48ffc7','40b70148ffc7'),  # DIL partial clobber.
+                 ('49897f30','6549897f30'),
+                 ('e800000000','c390909090'),  # Unreachable increment.
+                 ('8d48fd83f903','4885c9'),  # Similar normalization, unrelated gate.
+                 ('83f903','83f904')]
+        for before,after in changes:
+            with self.subTest(change=after), self.assertRaises(ValueError):
+                self.http_layout(raw.replace(bytes.fromhex(before),bytes.fromhex(after),1))
+
+    def test_http_gate_rejects_branch_into_comparison(self):
+        result,ins,data,off=self.http_layout()
+        source=ins[0].address-5
+        jump=b'\xe9'+struct.pack('<i',result['http']+1-source-5)
+        compare=next(n for n,i in enumerate(ins) if i.address==result['http'])
+        with self.assertRaisesRegex(ValueError,'branch into'):
+            http_budget(self.decode(jump,source)+ins,compare+1,data,off)
+
+    def test_http_replacement_supports_comparison_width_and_preserves_branch_flags(self):
+        base=self.layout()[0]
+        for raw in (self.http_fragment(),self.http_fragment().replace(bytes.fromhex('493b7f08'),bytes.fromhex('493bbf80000000'))):
+            gate,_,_,_=self.http_layout(raw)
+            sites=dict(base,**gate)
+            sites['offsets']={k:sites[k] for k in ('call','init','connection','deadline','http')}
+            patch=replacements(sites,dict(max_retries=20,interval_ms=1000))[-1]
+            self.assertEqual(patch[1],gate['http_size'])
+            self.assertEqual(self.decode(patch[2],0)[0].op_str,'eax, eax')
+
+    def transport_layout(self, shift=0, wrong_marker=False, extra_caller=False,
+                         wrapper=False, unrelated_parent=False, unlinked=False,
+                         tail=False, address_taken=False, function_pointer=False):
+        base=0x500000+shift
+        data=bytearray(b'\xcc'*0x200)
+        entry=base+0x180
+        endpoint=b'/responses'
+        encoding=b'$failed to encode responses request: '
+        data[0x100:0x100+len(endpoint)]=endpoint
+        data[0x120:0x120+len(encoding)]=b'?'*len(encoding) if wrong_marker else encoding
+        def call(at,target):
+            return b'\xe8'+struct.pack('<i',target-at-5)
+        def request(at,target):
+            code=b'\x48\x8d\x0d'+struct.pack('<i',0x100-at-7)
+            code+=b'\x48\x8d\x15'+struct.pack('<i',0x120-at-14)
+            return code+call(at+14,target)
+        code=request(0x20,0x180)
+        if wrapper and not unlinked:
+            code+=call(0x20+len(code),0x80)
+        code+=b'\xc3'
+        data[0x20:0x20+len(code)]=code
+        functions=[(0x20,len(code))]
+        # A raw CALL byte in a MOVABS immediate has a plausible relative
+        # destination but is not a decoded instruction boundary.
+        false=b'\x48\xb8\xe8'+struct.pack('<i',0x180-0x67)+b'\0'*3+b'\xc3'
+        data[0x60:0x60+len(false)]=false
+        functions.append((0x60,len(false)))
+        if extra_caller:
+            data[0x80:0x86]=b'\xe8'+struct.pack('<i',0x180-0x85)+b'\xc3'
+            functions.append((0x80,6))
+        if wrapper:
+            raw=call(0x80,0x180)+b'\xc3'
+            if tail:
+                raw=b'\xe9'+raw[1:]
+            data[0x80:0x80+len(raw)]=raw
+            functions.append((0x80,len(raw)))
+            raw=(call(0xa0,0x80) if unrelated_parent else request(0xa0,0x80))+b'\xc3'
+            data[0xa0:0xa0+len(raw)]=raw
+            functions.append((0xa0,len(raw)))
+        if address_taken:
+            raw=b'\x48\x8d\x05'+struct.pack('<i',0x180-0xc7)+b'\xc3'
+            data[0xc0:0xc0+len(raw)]=raw
+            functions.append((0xc0,len(raw)))
+        if function_pointer:
+            data[0x1c0:0x1c8]=struct.pack('<Q',entry)
+        data[-1]=0xe8  # A truncated scan candidate must be ignored.
+        def function(at):
+            for start,size in functions:
+                if start<=at<start+size:
+                    return (base+start,base+start+size),self.decode(data[start:start+size],base+start)
+            raise ValueError('outside fixture function')
+        def refs(ins,needle):
+            for i in ins:
+                for op in i.operands:
+                    if op.type==3 and i.reg_name(op.mem.base)=='rip':
+                        at=i.address+i.size+op.mem.disp-base
+                        if data[at:at+len(needle)]==needle:
+                            return True
+            return False
+        return responses_transport(data,entry,function,lambda va:va-base,lambda at:base+at,refs)
+
+    def test_outlined_http_requires_responses_caller_and_instruction_alignment(self):
+        for shift in (0,0x12340000):
+            self.assertEqual(self.transport_layout(shift),0x50002e+shift)
+
+    def test_outlined_http_rejects_unproven_or_shared_request_scope(self):
+        for options in (dict(wrong_marker=True),dict(extra_caller=True),
+                        dict(address_taken=True),dict(function_pointer=True)):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.transport_layout(**options)
+
+    def test_outlined_http_accepts_wrapper_with_only_proven_model_callers(self):
+        for shift in (0,0x12340000):
+            self.assertEqual(self.transport_layout(shift,wrapper=True),0x50002e+shift)
+
+    def test_outlined_http_rejects_unknown_or_disconnected_wrapper_callers(self):
+        for options in (dict(unrelated_parent=True),dict(unlinked=True),dict(tail=True)):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.transport_layout(wrapper=True,**options)
 
 
 if __name__=='__main__': unittest.main()

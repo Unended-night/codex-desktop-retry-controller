@@ -5,13 +5,47 @@ offsets and model/SSE string references must agree. Behavioral verification is
 a separate mandatory gate in Manager; this module alone never grants approval.
 """
 import bisect
+import copy
+import hashlib
 from pathlib import Path
 import re
 import struct
 import sys
+import threading
+
+
+_analysis_lock = threading.Lock()
+_analysis_key = None
+_analysis_result = None
+
+
+def _mapped_va(pe, base, offset):
+    rva = pe.get_rva_from_offset(offset)
+    if rva is None:
+        raise ValueError('file offset is outside mapped PE sections')
+    return base + rva
 
 
 def locate(data, error):
+    """Reuse successful analysis of identical bytes, never behavioral approval.
+
+    Retain one small result rather than the executable or decoded functions.
+    Every call hashes all input bytes; changed files and failures are reanalyzed.
+    Callers receive independent results so parameter generation cannot poison it.
+    """
+    global _analysis_key, _analysis_result
+    if not isinstance(data, bytes):
+        data = bytes(data)
+    key = hashlib.sha256(data).digest()
+    with _analysis_lock:
+        if key != _analysis_key:
+            result = _locate(data, error)
+            _analysis_result = copy.deepcopy(result)
+            _analysis_key = key
+        return copy.deepcopy(_analysis_result)
+
+
+def _locate(data, error):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'research/.deps'))
     try:
         import capstone
@@ -31,7 +65,7 @@ def locate(data, error):
         def off(va):
             return pe.get_offset_from_rva(va-base)
         def va(offset):
-            return base+pe.get_rva_from_offset(offset)
+            return _mapped_va(pe,base,offset)
         def function(offset):
             address=va(offset)-base
             index=bisect.bisect_right(starts,address)-1
