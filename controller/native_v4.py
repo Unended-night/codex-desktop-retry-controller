@@ -299,10 +299,10 @@ def http_budget(ins, index, data, off):
     if not (copy.mnemonic == 'mov' and all(o.type == 1 and o.size == 8 for o in copy.operands)
             and subtract.mnemonic == 'sub' and reg(subtract.operands[0], copy.operands[0].reg)
             and subtract.operands[0].size == 8 and subtract.operands[1].type == 2
-            and subtract.operands[1].imm == 4
+            and 0 < subtract.operands[1].imm <= 0x7fffffff
             and default.mnemonic == 'mov' and default.operands[0].type == 1
             and default.operands[0].size == 4 and default.operands[1].type == 2
-            and default.operands[1].imm == 1
+            and 0 <= default.operands[1].imm <= 0xffffffff
             and select.mnemonic == 'cmovae' and all(o.type == 1 and o.size == 8 for o in select.operands)
             and reg(select.operands[1], copy.operands[0].reg)):
         raise ValueError('HTTP error normalization changed')
@@ -313,10 +313,13 @@ def http_budget(ins, index, data, off):
     if not (aliases.get(selected) == default.operands[0].reg
             and selected != copy.operands[0].reg
             and adjust.mnemonic == 'lea' and adjust.operands[0].type == 1
-            and adjust.operands[0].size == 4 and mem(adjust.operands[1], selected, -3)
+            and adjust.operands[0].size == 4 and mem(adjust.operands[1], selected)
+            and -0x7fffffff <= adjust.operands[1].mem.disp < 0
             and limit.mnemonic == 'cmp' and reg(limit.operands[0], adjust.operands[0].reg)
             and limit.operands[0].size == 4 and limit.operands[1].type == 2
-            and limit.operands[1].imm == 3
+            and 0 < limit.operands[1].imm <= 0x7fffffff
+            and ((default.operands[1].imm + adjust.operands[1].mem.disp) & 0xffffffff)
+                >= limit.operands[1].imm
             and reject.mnemonic == 'jae' and reject.operands[0].type == 2
             and reject.operands[0].imm in boundaries and reject.operands[0].imm > reject.address):
         raise ValueError('HTTP error range changed')
@@ -378,20 +381,63 @@ def http_budget(ins, index, data, off):
     return dict(http=compare.address,http_size=compare.size)
 
 
-def responses_transport(data, entry, function, off, va, refs):
-    """Require Responses callers, allowing one outlined instrumentation layer.
+def protocol_slice(ins, needle, data, off):
+    """Find a literal pointer/length pair, rather than a log containing a path.
 
-    Newer builds outline HTTP retry separately from sampling telemetry. The
-    retry helper must have a direct model caller. An extra wrapper is accepted
-    only when that model caller also calls it, and all its decoded callers
-    build Responses requests. Unknown callers, tail calls and address-taking
-    fail closed. This bounded call graph supplements mandatory behavior tests;
-    it is not a general whole-program indirect-call analysis.
+    A Rust string slice stores a pointer followed by its byte length. Neither
+    the state base register nor the field offset is prescribed here.
     """
-    def model(ins):
-        return refs(ins,b'/responses') and refs(ins,b'$failed to encode responses request: ')
+    for n, i in enumerate(ins[:-2]):
+        if not (i.mnemonic == 'lea' and len(i.operands) == 2
+                and i.operands[0].type == 1 and i.operands[0].size == 8
+                and mem(i.operands[1]) and i.reg_name(i.operands[1].mem.base) == 'rip'):
+            continue
+        try:
+            at = off(i.address + i.size + i.operands[1].mem.disp)
+        except (ValueError, IndexError, KeyError):
+            continue
+        if data[at:at+len(needle)] != needle:
+            continue
+        pointer, length = ins[n+1:n+3]
+        if not (pointer.mnemonic == length.mnemonic == 'mov'
+                and len(pointer.operands) == len(length.operands) == 2):
+            continue
+        dst, src = pointer.operands
+        count_dst, count = length.operands
+        if (mem(dst) and dst.size == 8 and src.type == 1 and src.size == 8
+                and src.reg == i.operands[0].reg and dst.mem.base != src.reg
+                and mem(count_dst, dst.mem.base, dst.mem.disp + 8) and count_dst.size == 8
+                and count.type == 2 and count.imm == len(needle)):
+            return True
+    return False
 
-    def callers(target):
+
+class ResponsesCallGraph:
+    """Bounded caller proof using the Responses protocol, without log names.
+
+    Every decoded caller must lead to a Responses request builder. Wrappers
+    must also be connected to a common model caller; disconnected lookalikes,
+    cycles, tail calls and address-taking are refused. This is a finite direct
+    call analysis, not a proof about arbitrary indirect calls.
+    """
+    MAX_WRAPPERS = 4
+    MAX_FUNCTIONS = 64
+
+    def __init__(self, data, function, off, va, refs):
+        self.data, self.function, self.off, self.va = data, function, off, va
+        self.incoming = {}
+        self.models = {}
+
+    def model(self, ins):
+        entry = ins[0].address
+        if entry not in self.models:
+            self.models[entry] = protocol_slice(ins, b'/responses', self.data, self.off)
+        return self.models[entry]
+
+    def callers(self, target):
+        if target in self.incoming:
+            return self.incoming[target]
+        data, function, va = self.data, self.function, self.va
         if struct.pack('<Q',target) in data:
             raise ValueError('HTTP transport has an indirect function pointer')
         result=[]
@@ -420,31 +466,59 @@ def responses_transport(data, entry, function, off, va, refs):
                 result.append((bounds[0],call.address,ins))
         if not result:
             raise ValueError('HTTP transport has no decoded callers')
+        self.incoming[target] = result
         return result
 
-    incoming=callers(entry)
-    direct=[c for c in incoming if model(c[2])]
-    # A unique direct model function anchors any instrumentation wrapper.
-    root=only(sorted({c[0] for c in direct}),'Responses HTTP model caller')
-    for wrapper,_,ins in incoming:
-        if wrapper==root:
-            continue
-        parents=callers(wrapper)
-        if (wrapper==entry or not any(p[0]==root for p in parents)
-                or any(not model(p[2]) or p[0] in (entry,wrapper) for p in parents)):
+    def prove(self, entry):
+        edges, roots, wrappers = {}, {}, set()
+        visits = 0
+
+        def walk(target, path):
+            nonlocal visits
+            visits += 1
+            if target in path:
+                raise ValueError('HTTP wrapper call graph has a cycle')
+            if len(path) > self.MAX_WRAPPERS:
+                raise ValueError('HTTP wrapper call graph exceeds supported depth')
+            if visits > self.MAX_FUNCTIONS:
+                raise ValueError('HTTP wrapper call graph exceeds supported size')
+            for caller, site, ins in self.callers(target):
+                if caller == entry or caller in path:
+                    raise ValueError('HTTP wrapper call graph has a cycle')
+                edges.setdefault(caller, set()).add(target)
+                if self.model(ins):
+                    roots.setdefault(caller, []).append(site)
+                else:
+                    wrappers.add(caller)
+                    walk(caller, path + (target,))
+
+        walk(entry, ())
+        direct = {c[0] for c in self.callers(entry) if self.model(c[2])}
+        root = only(sorted(direct or roots), 'Responses HTTP model caller')
+        reachable, pending = set(), [root]
+        while pending:
+            node = pending.pop()
+            if node not in reachable:
+                reachable.add(node)
+                pending.extend(edges.get(node, ()))
+        if not wrappers.issubset(reachable):
             raise ValueError('HTTP wrapper has an unproven Responses caller')
-    return direct[0][1]
+        return min(roots[root])
+
+
+def responses_transport(data, entry, function, off, va, refs):
+    return ResponsesCallGraph(data, function, off, va, refs).prove(entry)
 
 
 def locate_outlined(data, function, off, va, refs, cs):
     candidates=[]
     # A cheap scan narrows decoding to calls returning an Option<Duration>.
-    pattern=rb'\xe8....\x90?\x81\xfa\x00\xca\x9a\x3b(?:\x75.|\x0f\x85....)'
+    pattern=(rb'\xe8....(?:\x90|\x66\x90|\x0f\x1f\x00|\x0f\x1f\x40.){0,4}'
+             rb'\x81\xfa\x00\xca\x9a\x3b(?:\x75.|\x0f\x85....)')
     for match in re.finditer(pattern,data,re.S):
         try:
             _,ins=function(match.start())
             n=next(n for n,i in enumerate(ins) if i.address==va(match.start()) and i.mnemonic=='call')
-            if not refs(ins,b'stream connection failed; waiting to retry'): continue
             target=ins[n].operands[0].imm
             bounds,helper=function(off(target))
             if target!=bounds[0]: continue
@@ -452,31 +526,33 @@ def locate_outlined(data, function, off, va, refs, cs):
         except (ValueError,KeyError,IndexError,StopIteration):
             continue
     result=only(candidates,'sampling policy')
-    http=[]
-    outlined_http=[]
-    pattern=rb'[\x48-\x4f]\x83[\xe8-\xef]\x04[\x40-\x41]?[\xb8-\xbf]\x01\x00\x00\x00[\x48-\x4f]\x0f\x43[\xc0-\xff]'
+    http={}
+    graph=ResponsesCallGraph(data,function,off,va,refs)
+    # SUB r64, imm8/imm32; MOV r32, imm32; CMOVAE r64, r64. The
+    # constants are enum inputs, not identities of a particular release.
+    pattern=(rb'[\x48-\x4f](?:\x83[\xe8-\xef].|\x81[\xe8-\xef]....|\x2d....)'
+             rb'[\x40-\x41]?[\xb8-\xbf]....[\x48-\x4f]\x0f\x43[\xc0-\xff]')
     for match in re.finditer(pattern,data,re.S):
         try:
             bounds,ins=function(match.start())
-            legacy=refs(ins,b'httprequeststreamsampling')
-            outlined=refs(ins,b'requestcodex.retry')
-            if not (refs(ins,b'text/event-stream') and (legacy or outlined)):
+            if not refs(ins,b'text/event-stream'):
                 continue
             n=next(n for n,i in enumerate(ins) if i.address==va(match.start()))
             if n<4: continue
             site=http_budget(ins,n-3,data,off)
-            if outlined:
-                outlined_http.append((bounds[0],site))
-            else:
-                http.append(site)
         except (ValueError,KeyError,IndexError,StopIteration):
             continue
-    if outlined_http:
-        entry,site=only(outlined_http,'outlined model HTTP budget')
-        responses_transport(data,entry,function,off,va,refs)
-        result.update(site)
-    else:
-        result.update(only(http,'model HTTP budget'))
+        # A structurally valid SSE retry loop with unproven callers cannot
+        # silently be ignored in favour of a different, easier candidate.
+        graph.prove(bounds[0])
+        http[site['http']]=dict(site,offset=off(site['http']))
+    if not http:
+        raise ValueError('outlined model HTTP budget: no proven Responses gate')
+    # Releases may keep several Responses implementations side by side. Apply
+    # the same inner-budget policy to every proven model gate, without choosing
+    # a release-specific telemetry name as the active implementation.
+    result['http_sites']=[http[k] for k in sorted(http)]
+    result.update(result['http_sites'][0])
     result['family']='responses-sampling-x64-outlined'
     result['offsets']={k:off(result[k]) for k in ('call','init','deadline','connection','http')}
     return result
@@ -494,8 +570,12 @@ def replacements(s,p):
     code+=b'\xb8'+struct.pack('<I',p['interval_ms']//1000)+b'\xba'+struct.pack('<I',p['interval_ms']%1000*1_000_000)
     code+=jmp(cave+len(code),s['continuation'])
     offsets=s['offsets']
-    return [(offsets['call'],5,jmp(s['call'],cave+5),'model_outer_policy'),
+    patches=[(offsets['call'],5,jmp(s['call'],cave+5),'model_outer_policy'),
             (offsets['connection'],s['bounded']-cave,code,'bounded_connection_and_native_classifier'),
             (offsets['init'],s['init_size'],b'\xb8'+struct.pack('<I',p['max_retries']),'model_outer_budget'),
-            (offsets['deadline'],s['deadline_size'],b'\xb9'+struct.pack('<I',SENTINEL),'ignore_server_deadline'),
-            (offsets['http'],s.get('http_size',7),bytes.fromhex('39c0'),'model_http_budget')]
+            (offsets['deadline'],s['deadline_size'],b'\xb9'+struct.pack('<I',SENTINEL),'ignore_server_deadline')]
+    sites=s.get('http_sites',[dict(offset=offsets['http'],http_size=s.get('http_size',7))])
+    for n,site in enumerate(sites):
+        label='model_http_budget' if len(sites)==1 else f'model_http_budget_{n+1}'
+        patches.append((site['offset'],site['http_size'],bytes.fromhex('39c0'),label))
+    return patches

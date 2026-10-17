@@ -3,14 +3,16 @@ import json
 from pathlib import Path
 import struct
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'research/.deps'))
 import capstone
-from controller.native import _mapped_va
-from controller.native_v4 import classifier, http_budget, outer, replacements, responses_transport, safe_ranges
+from controller.native import _file_address_map, _mapped_va
+from controller.native_v4 import (classifier, http_budget, locate_outlined, outer,
+                                  protocol_slice, replacements, responses_transport, safe_ranges)
 from controller import native
 
 
@@ -44,6 +46,28 @@ class AnalysisCacheTests(unittest.TestCase):
                 native.locate(b'changed!', ValueError)
             self.assertEqual(native.locate(b'changed!', ValueError), {'http': 8})
         self.assertEqual(analyze.call_count, 3)
+
+
+class FileAddressTests(unittest.TestCase):
+    def image(self, sections):
+        return SimpleNamespace(
+            OPTIONAL_HEADER=SimpleNamespace(ImageBase=0x140000000,SizeOfHeaders=0x200),
+            sections=[SimpleNamespace(PointerToRawData=start,SizeOfRawData=size,
+                                      VirtualAddress=rva) for start,size,rva in sections])
+
+    def test_section_mapping_handles_headers_gaps_and_different_rva_deltas(self):
+        address=_file_address_map(self.image([(0x600,0x200,0x5000),(0x200,0x200,0x1000)]),0x900)
+        for at,expected in ((0x80,0x80),(0x200,0x1000),(0x3ff,0x11ff),(0x600,0x5000),(0x7ff,0x51ff)):
+            self.assertEqual(address(at),0x140000000+expected)
+        for at in (-1,0x400,0x800,0x900):
+            with self.subTest(at=at),self.assertRaises(ValueError):
+                address(at)
+
+    def test_overlapping_or_empty_sections_are_refused(self):
+        for sections in ([(0x100,0x200,0x1000)],[(0x200,0x300,0x1000),(0x400,0x100,0x4000)],
+                         [(0x1000,0x100,0x1000)]):
+            with self.subTest(sections=sections),self.assertRaises(ValueError):
+                _file_address_map(self.image(sections),0x900)
 
 
 class OutlinedTests(unittest.TestCase):
@@ -243,7 +267,8 @@ class OutlinedTests(unittest.TestCase):
                  ('49897f30','6549897f30'),
                  ('e800000000','c390909090'),  # Unreachable increment.
                  ('8d48fd83f903','4885c9'),  # Similar normalization, unrelated gate.
-                 ('83f903','83f904')]
+                 ('83f903','83f900'),  # Empty error range.
+                 ('b801000000','b803000000')]  # Fallback enters retry range.
         for before,after in changes:
             with self.subTest(change=after), self.assertRaises(ValueError):
                 self.http_layout(raw.replace(bytes.fromhex(before),bytes.fromhex(after),1))
@@ -266,22 +291,118 @@ class OutlinedTests(unittest.TestCase):
             self.assertEqual(patch[1],gate['http_size'])
             self.assertEqual(self.decode(patch[2],0)[0].op_str,'eax, eax')
 
-    def transport_layout(self, shift=0, wrong_marker=False, extra_caller=False,
-                         wrapper=False, unrelated_parent=False, unlinked=False,
+    def test_http_enum_numbers_and_immediate_width_can_change(self):
+        raw=self.http_fragment()
+        changed=raw.replace(bytes.fromhex('4883e904b801000000'),
+                            bytes.fromhex('4881e909000000b802000000'))
+        changed=changed.replace(bytes.fromhex('8d48fd83f903'),bytes.fromhex('8d48fa83f905'))
+        for variant in (raw,changed):
+            self.http_layout(variant)
+
+    def outlined_image(self, gates=1, unknown_caller=False, missing_endpoint=False,
+                       changed_enum=False, duplicate_outer=False):
+        """Sparse real outer fragment plus synthetic protocol-scoped gates.
+
+        No log, instrumentation or function-name strings exist in this image.
+        Mutated instructions are decoded only and are never executed.
+        """
+        base=0x100000
+        data=bytearray()
+        functions=[]
+        outer_raw=bytearray.fromhex(self.fixture['outer']['hex'])
+        original=self.decode(outer_raw,base)
+        call=next(i for i in original if i.mnemonic=='call' and
+                  i.operands[0].imm==self.fixture['helper']['va']-self.fixture['outer']['va']+base)
+        helper_raw=bytes.fromhex(self.fixture['helper']['hex'])
+        helper_at=len(outer_raw)+16
+        struct.pack_into('<i',outer_raw,call.address-base+1,helper_at-(call.address-base)-5)
+        def add(raw):
+            at=len(data)
+            data.extend(raw)
+            functions.append((at,len(raw)))
+            data.extend(b'\xcc'*16)
+            return at
+        add(outer_raw)
+        add(helper_raw)
+        if duplicate_outer:
+            other=bytearray(outer_raw)
+            struct.pack_into('<i',other,call.address-base+1,helper_at-len(data)-(call.address-base)-5)
+            add(other)
+        http=[]
+        references=[]
+        for _ in range(gates):
+            raw=self.http_fragment()
+            if changed_enum:
+                raw=raw.replace(bytes.fromhex('4883e904b801000000'),
+                                bytes.fromhex('4881e909000000b802000000'))
+                raw=raw.replace(bytes.fromhex('8d48fd83f903'),bytes.fromhex('8d48fa83f905'))
+            # Resolve synthetic conditional exits before adding protocol LEA.
+            _,_,raw,_=self.http_layout(raw)
+            at=add(b'\x48\x8d\x05'+b'\0'*4+raw)
+            references.append((at,7))
+            http.append(at)
+        root_at=len(data)
+        root=b'\x48\x8d\x05'+b'\0'*4
+        root+=bytes.fromhex('488944243048c74424380a000000')
+        for at in http:
+            source=root_at+len(root)
+            root+=b'\xe8'+struct.pack('<i',at-source-5)
+        add(root+b'\xc3')
+        if unknown_caller:
+            at=len(data)
+            add(b'\xe8'+struct.pack('<i',http[-1]-at-5)+b'\xc3')
+        sse_at=len(data)
+        data.extend(b'text/event-stream\0')
+        endpoint_at=len(data)
+        data.extend(b'/unrelated\0' if missing_endpoint else b'/responses\0')
+        for at,size in references:
+            struct.pack_into('<i',data,at+size-4,sse_at-at-size)
+        struct.pack_into('<i',data,root_at+3,endpoint_at-root_at-7)
+        def function(at):
+            for start,size in functions:
+                if start<=at<start+size:
+                    return (base+start,base+start+size),self.decode(data[start:start+size],base+start)
+            raise ValueError('outside fixture function')
+        def refs(ins,needle):
+            return any(o.type==3 and i.reg_name(o.mem.base)=='rip' and
+                       data[i.address+i.size+o.mem.disp-base:][:len(needle)]==needle
+                       for i in ins for o in i.operands)
+        return locate_outlined(data,function,lambda va:va-base,lambda at:base+at,refs,None)
+
+    def test_locator_needs_no_log_or_function_names(self):
+        for changed_enum in (False,True):
+            s=self.outlined_image(changed_enum=changed_enum)
+            self.assertEqual(len(s['http_sites']),1)
+            self.assertEqual(len(replacements(s,dict(max_retries=20,interval_ms=1000))),5)
+
+    def test_locator_handles_multiple_proven_responses_gates(self):
+        s=self.outlined_image(gates=2)
+        patches=replacements(s,dict(max_retries=20,interval_ms=1000))
+        self.assertEqual(len(patches),6)
+        self.assertEqual({p[0] for p in patches[-2:]},{g['offset'] for g in s['http_sites']})
+
+    def test_locator_refuses_unproven_gate_even_when_another_gate_is_valid(self):
+        for options in (dict(gates=2,unknown_caller=True),dict(missing_endpoint=True),dict(duplicate_outer=True)):
+            with self.subTest(options=options),self.assertRaises(ValueError):
+                self.outlined_image(**options)
+
+    def transport_layout(self, shift=0, wrong_marker=False, extra_caller=False, wrong_endpoint=False,
+                         wrapper=False, unrelated_parent=False, unlinked=False, wrong_length=False,
                          tail=False, address_taken=False, function_pointer=False):
         base=0x500000+shift
         data=bytearray(b'\xcc'*0x200)
         entry=base+0x180
         endpoint=b'/responses'
         encoding=b'$failed to encode responses request: '
-        data[0x100:0x100+len(endpoint)]=endpoint
+        data[0x100:0x100+len(endpoint)]=b'?'*len(endpoint) if wrong_endpoint else endpoint
         data[0x120:0x120+len(encoding)]=b'?'*len(encoding) if wrong_marker else encoding
         def call(at,target):
             return b'\xe8'+struct.pack('<i',target-at-5)
         def request(at,target):
-            code=b'\x48\x8d\x0d'+struct.pack('<i',0x100-at-7)
-            code+=b'\x48\x8d\x15'+struct.pack('<i',0x120-at-14)
-            return code+call(at+14,target)
+            code=b'\x48\x8d\x05'+struct.pack('<i',0x100-at-7)
+            code+=bytes.fromhex('488944243048c7442438')+struct.pack('<I',11 if wrong_length else 10)
+            code+=b'\x48\x8d\x15'+struct.pack('<i',0x120-at-len(code)-7)
+            return code+call(at+len(code),target)
         code=request(0x20,0x180)
         if wrapper and not unlinked:
             code+=call(0x20+len(code),0x80)
@@ -329,22 +450,88 @@ class OutlinedTests(unittest.TestCase):
 
     def test_outlined_http_requires_responses_caller_and_instruction_alignment(self):
         for shift in (0,0x12340000):
-            self.assertEqual(self.transport_layout(shift),0x50002e+shift)
+            self.assertEqual(self.transport_layout(shift),0x50003c+shift)
 
     def test_outlined_http_rejects_unproven_or_shared_request_scope(self):
-        for options in (dict(wrong_marker=True),dict(extra_caller=True),
+        for options in (dict(wrong_endpoint=True),dict(wrong_length=True),dict(extra_caller=True),
                         dict(address_taken=True),dict(function_pointer=True)):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.transport_layout(**options)
 
+    def test_diagnostic_text_is_not_required_for_protocol_scope(self):
+        self.assertEqual(self.transport_layout(wrong_marker=True),0x50003c)
+
     def test_outlined_http_accepts_wrapper_with_only_proven_model_callers(self):
         for shift in (0,0x12340000):
-            self.assertEqual(self.transport_layout(shift,wrapper=True),0x50002e+shift)
+            self.assertEqual(self.transport_layout(shift,wrapper=True),0x50003c+shift)
 
     def test_outlined_http_rejects_unknown_or_disconnected_wrapper_callers(self):
         for options in (dict(unrelated_parent=True),dict(unlinked=True),dict(tail=True)):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.transport_layout(wrapper=True,**options)
+
+    def transport_chain(self, depth, cycle=False, shared=False):
+        base=0x900000
+        data=bytearray(b'\xcc'*0x1000)
+        functions={}
+        entry=0x700
+        wrappers=[0x100+n*0x40 for n in range(depth)]
+        def add(at,targets,model=False):
+            raw=b''
+            if model:
+                raw=b'\x48\x8d\x05'+struct.pack('<i',0x800-at-7)
+                raw+=bytes.fromhex('488944243048c74424380a000000')
+            for target in targets:
+                raw+=b'\xe8'+struct.pack('<i',target-at-len(raw)-5)
+            raw+=b'\xc3'
+            data[at:at+len(raw)]=raw
+            functions[at]=len(raw)
+        add(0x20,[wrappers[0] if wrappers else entry],model=True)
+        for n,at in enumerate(wrappers):
+            targets=[wrappers[n+1] if n+1<len(wrappers) else entry]
+            if cycle and n==len(wrappers)-1:
+                targets.append(wrappers[0])
+            add(at,targets)
+        if shared:
+            add(0x600,[wrappers[-1] if wrappers else entry])
+        data[0x800:0x80b]=b'/responses\0'
+        def function(at):
+            for start,size in functions.items():
+                if start<=at<start+size:
+                    return (base+start,base+start+size),self.decode(data[start:start+size],base+start)
+            raise ValueError('outside fixture function')
+        def refs(ins,needle):
+            return any(o.type==3 and i.reg_name(o.mem.base)=='rip' and
+                       data[i.address+i.size+o.mem.disp-base:][:len(needle)]==needle
+                       for i in ins for o in i.operands)
+        return responses_transport(data,base+entry,function,lambda va:va-base,lambda at:base+at,refs)
+
+    def test_protocol_scope_accepts_bounded_wrapper_chains_without_direct_model_call(self):
+        for depth in range(5):
+            with self.subTest(depth=depth):
+                self.assertEqual(self.transport_chain(depth),0x900035)
+
+    def test_protocol_literal_requires_matching_pointer_and_length_fields(self):
+        base=0xa00000
+        needle=b'/responses'
+        def accepts(stores, suffix=b''):
+            code=bytes.fromhex('4c8d15')+struct.pack('<i',0x80-7)+bytes.fromhex(stores)+b'\xc3'
+            data=code.ljust(0x80,b'\xcc')+needle+suffix
+            return protocol_slice(self.decode(code,base),needle,data,lambda va:va-base)
+        # R10 feeds a state field; its length belongs to the next qword.
+        self.assertTrue(accepts('4c89935801000048c783600100000a000000'))
+        for stores in ('',  # A bare reference may be a log or debug string.
+                       '4c89935801000048c783600100000b000000',  # Prefix, wrong length.
+                       '4c89935801000048c783680100000a000000',  # Wrong field.
+                       '4c89935801000048c787600100000a000000',  # Different state.
+                       '4c898b5801000048c783600100000a000000'):  # Different pointer.
+            with self.subTest(stores=stores):
+                self.assertFalse(accepts(stores,b'/compact'))
+
+    def test_protocol_scope_refuses_cycles_excessive_depth_and_shared_wrappers(self):
+        for options in (dict(depth=5),dict(depth=2,cycle=True),dict(depth=2,shared=True)):
+            with self.subTest(options=options),self.assertRaises(ValueError):
+                self.transport_chain(**options)
 
 
 if __name__=='__main__': unittest.main()

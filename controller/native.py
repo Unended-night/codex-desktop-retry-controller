@@ -26,6 +26,33 @@ def _mapped_va(pe, base, offset):
     return base + rva
 
 
+def _file_address_map(pe, length):
+    """Map file offsets without repeatedly walking PE section metadata."""
+    base = pe.OPTIONAL_HEADER.ImageBase
+    regions = sorted((s.PointerToRawData,
+                      min(length, s.PointerToRawData + s.SizeOfRawData),
+                      base + s.VirtualAddress) for s in pe.sections if s.SizeOfRawData)
+    headers = min(pe.OPTIONAL_HEADER.SizeOfHeaders, length)
+    previous = headers
+    for start, end, _ in regions:
+        if start < previous or end <= start:
+            raise ValueError('overlapping or invalid mapped PE sections')
+        previous = end
+    starts = [r[0] for r in regions]
+
+    def address(offset):
+        index = bisect.bisect_right(starts, offset) - 1
+        if index >= 0:
+            start, end, va = regions[index]
+            if start <= offset < end:
+                return va + offset - start
+        if 0 <= offset < headers:
+            return base + offset
+        raise ValueError('file offset is outside mapped PE sections')
+
+    return address
+
+
 def locate(data, error):
     """Reuse successful analysis of identical bytes, never behavioral approval.
 
@@ -57,33 +84,46 @@ def _locate(data, error):
         if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20b:
             raise ValueError('requires Windows x64 PE')
         base = pe.OPTIONAL_HEADER.ImageBase
+        # Map raw sections once. Call-graph queries otherwise ask pefile to
+        # normalize every section for each possible relative-call byte.
+        va = _file_address_map(pe, len(data))
         section = next(s for s in pe.sections if s.Name.rstrip(b'\0') == b'.pdata')
         functions = list(struct.iter_unpack('<III', data[section.PointerToRawData:section.PointerToRawData+section.Misc_VirtualSize]))
         starts = [f[0] for f in functions]
         cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
         cs.detail = True
+        decoded_index, decoded_result = None, None
+        reference_results = {}
         def off(va):
             return pe.get_offset_from_rva(va-base)
-        def va(offset):
-            return _mapped_va(pe,base,offset)
         def function(offset):
+            nonlocal decoded_index, decoded_result
             address=va(offset)-base
             index=bisect.bisect_right(starts,address)-1
             if index < 0: raise ValueError('missing function')
             a,z,_=functions[index]
             if not a<=address<z: raise ValueError('outside function')
+            if index == decoded_index:
+                return decoded_result
             instructions=list(cs.disasm(data[off(base+a):off(base+z-1)+1],base+a))
             if not instructions or instructions[-1].address+instructions[-1].size != base+z:
                 raise ValueError('incomplete instruction decoding')
-            return (base+a,base+z),instructions
+            decoded_index, decoded_result = index, ((base+a,base+z),instructions)
+            return decoded_result
         def refs(instructions, needle):
+            key = (instructions[0].address, needle)
+            if key in reference_results:
+                return reference_results[key]
             for i in instructions:
                 for op in i.operands:
                     if op.type == capstone.CS_OP_MEM and i.reg_name(op.mem.base)=='rip':
                         try:
                             at=off(i.address+i.size+op.mem.disp)
-                            if data[at:at+len(needle)]==needle: return True
+                            if data[at:at+len(needle)]==needle:
+                                reference_results[key] = True
+                                return True
                         except (ValueError,pefile.PEFormatError): pass
+            reference_results[key] = False
             return False
         def unique(pattern, start=0, end=None, label='instruction'):
             hits=list(re.finditer(pattern,data[start:end],re.S))
