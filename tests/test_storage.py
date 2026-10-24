@@ -3,12 +3,14 @@ import os
 from pathlib import Path
 import tempfile
 import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
 from controller.core import ControllerError, atomic_json
 import desktop_storage as storage
 from desktop_runtime import DesktopManager, operation_lock
+import desktop_runtime as runtime
 
 
 class StorageTests(unittest.TestCase):
@@ -79,7 +81,13 @@ class StorageTests(unittest.TestCase):
     def test_public_manual_entry_and_preview_use_zero_history(self):
         manager = DesktopManager(self.root)
         self.addCleanup(manager.close)
-        with patch.object(storage, 'process_paths', return_value=[]):
+        # Process mocks do not cross a child-process boundary. Run the actual
+        # worker entry in this process so retention uses the fixture inventory.
+        def run_in_process(command, *_):
+            with patch.object(sys, 'argv', command[4:]):
+                return runtime.main()
+        with patch.object(storage, 'process_paths', return_value=[]), \
+                patch('desktop_processes.run_worker', side_effect=run_in_process):
             report = manager.cleanup(dry_run=True)
             self.assertFalse(report['keep_history'])
             self.assertEqual(len(report['planned']), 2)

@@ -11,7 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'research/.deps'))
 import capstone
 from controller.native import _file_address_map, _mapped_va
-from controller.native_v4 import (classifier, http_budget, locate_outlined, outer,
+from controller.native_v4 import (classifier, duration_branch, http_budget, locate_outlined, outer,
                                   protocol_slice, replacements, responses_transport, safe_ranges)
 from controller import native
 
@@ -180,6 +180,107 @@ class OutlinedTests(unittest.TestCase):
                     prefix=classifier(self.decode(data,0x1000))
                     self.assertIn(struct.pack('<Q',mask),prefix)
 
+    def test_duration_none_encoding_and_branch_direction_come_from_the_caller(self):
+        for none_value in (1_000_000_000, 0xffffffff, 0xfffffffe):
+            for jump in (b'\x74', b'\x75'):
+                for compare in (b'\x81\xfa'+struct.pack('<I',none_value),
+                                b'\x83\xfa'+bytes([none_value & 255])):
+                    if len(compare)==3 and none_value==1_000_000_000:
+                        continue
+                    raw=b'\xe8\0\0\0\0\x90'+compare+jump+b'\x01\x90\xc3'
+                    ins=self.decode(raw,0x1000)
+                    expected=(ins[-2].address,ins[-1].address)
+                    if jump==b'\x75':
+                        expected=expected[::-1]
+                    with self.subTest(none_value=none_value,jump=jump,compare=compare):
+                        self.assertEqual(duration_branch(ins,0),(none_value,*expected))
+                        helper=self.helper().replace(bytes.fromhex('ba00ca9a3b'),b'\xba'+struct.pack('<I',none_value))
+                        classifier(self.decode(helper,0x2000),none_value)
+                        if none_value!=1_000_000_000:
+                            with self.assertRaisesRegex(ValueError,'None duration'):
+                                classifier(self.decode(self.helper(),0x2000),none_value)
+
+    def test_duration_branch_refuses_valid_nanoseconds_and_invalid_successors(self):
+        for raw in (bytes.fromhex('e80000000083fa01740190c3'),
+                    bytes.fromhex('e80000000083faff740290c3'),
+                    bytes.fromhex('e80000000083faff750090c3'),
+                    bytes.fromhex('e80000000083faff720190c3')):
+            with self.subTest(raw=raw.hex()),self.assertRaises(ValueError):
+                duration_branch(self.decode(raw,0x1000),0)
+
+    def test_outer_preserves_none_cleanup_between_connection_and_budget_blocks(self):
+        # Invented layout: a JE None branch skips over the live retry block.
+        # The cleanup block has an incoming edge and cannot become code space.
+        address=0x5000
+        for none_value in (1_000_000_000,0xffffffff):
+            data=bytearray()
+            labels={}
+            jumps=[]
+            def emit(raw):
+                data.extend(bytes.fromhex(raw))
+            def jump(opcode,target):
+                emit(opcode)
+                jumps.append((len(data),target))
+                data.extend(b'\0'*4)
+            emit('498b8508000000498985100000004c8b6d20488b7528')
+            emit('498955304889f1')
+            call_address=address+len(data)
+            data.extend(b'\xe8'+struct.pack('<i',0x3000-call_address-5))
+            data.extend(b'\x90\x81\xfa'+struct.pack('<I',none_value))
+            jump('0f84','absent')
+            emit('4c8b7d204989474041895748498b4750418b8f58000000')
+            emit('4989476041894f68498b47204885c04c8b4528')
+            jump('0f84','bounded')
+            jump('e9','bounded')
+            data.extend(b'\x90'*128)
+            labels['absent']=address+len(data)
+            emit('41c6477000c3')
+            labels['bounded']=address+len(data)
+            emit('498b4708488b08493b4f10')
+            jump('0f83','end')
+            emit('4d8b4f304c8908498b4710498b4720498b4740418b4f48')
+            data.extend(b'\x90'*18)
+            labels['end']=address+len(data)
+            emit('c3')
+            for at,target in jumps:
+                struct.pack_into('<i',data,at,labels[target]-address-at-4)
+            helper=self.helper().replace(bytes.fromhex('ba00ca9a3b'),b'\xba'+struct.pack('<I',none_value))
+            prefix=classifier(self.decode(helper,0x3000),none_value)
+            ins=self.decode(data,address)
+            call=next(n for n,i in enumerate(ins) if i.address==call_address)
+            sites=outer(ins,call,prefix,data,lambda va:va-address)
+            self.assertEqual(sites['connection_end'],labels['absent'])
+            self.assertGreater(sites['bounded'],sites['connection_end'])
+            self.assertEqual(sites['bounded_reload'],bytes.fromhex('4c8b4528'))
+            sites.update(http=labels['end'],http_size=3)
+            sites['offsets']={k:sites[k]-address for k in ('call','init','deadline','connection','http')}
+            patches=replacements(sites,dict(max_retries=30,interval_ms=1000))
+            trampoline=self.decode(patches[1][2],sites['connection'])
+            self.assertEqual(trampoline[0].op_str,'r8, qword ptr [rbp + 0x28]')
+            self.assertEqual(trampoline[1].operands[0].imm,sites['bounded'])
+            redirect=self.decode(patches[0][2],sites['call'])[0]
+            self.assertEqual(redirect.operands[0].imm,trampoline[2].address)
+            before=bytes(data)
+            for at,size,new,_ in patches[:-1]:
+                self.assertLessEqual(len(new),size)
+                data[at:at+size]=new+b'\x90'*(size-len(new))
+            self.assertEqual(data[labels['absent']-address:labels['bounded']-address],
+                             before[labels['absent']-address:labels['bounded']-address])
+            self.assertEqual(patches[3][2],b'\xb9'+struct.pack('<I',none_value))
+            for before_hex,after_hex in (('4c8b4528','4c8b4530'),
+                                         ('4885c04c8b4528','4c8b45284531c0'),
+                                         ('488b7528','9031f690')):
+                changed=before.replace(bytes.fromhex(before_hex),bytes.fromhex(after_hex),1)
+                self.assertEqual(len(changed),len(before))
+                changed_ins=self.decode(changed,address)
+                changed_call=next(n for n,i in enumerate(changed_ins) if i.address==call_address)
+                with self.assertRaisesRegex(ValueError,'bounded error'):
+                    outer(changed_ins,changed_call,prefix,changed,lambda va:va-address)
+            wrong_prefix=classifier(self.decode(self.helper(),0x3000))
+            if none_value!=1_000_000_000:
+                with self.assertRaisesRegex(ValueError,'None duration'):
+                    outer(ins,call,wrong_prefix,before,lambda va:va-address)
+
     def test_classifier_rejects_unproven_tag_flags_mask_and_sentinel(self):
         raw=self.helper()
         changes=[('4885d2','4885c0'),  # Sign flags from attempt instead of tag.
@@ -243,6 +344,17 @@ class OutlinedTests(unittest.TestCase):
         for raw in variants:
             self.http_layout(raw)
 
+    def test_http_gate_accepts_signed_normalization_with_the_same_field_proof(self):
+        for indirect in (False,True):
+            raw=self.http_fragment(indirect).replace(bytes.fromhex('480f43c1'),bytes.fromhex('480f4dc1'))
+            raw=raw.replace(bytes.fromhex('4883e904'),bytes.fromhex('4883e903'))
+            self.http_layout(raw)
+            for before,after in (('480f4dc1','480f4cc1'),
+                                 ('b801000000480f4dc1','31c0480f4dc1909090'),
+                                 ('49897f30','49897e30')):
+                with self.subTest(change=after),self.assertRaises(ValueError):
+                    self.http_layout(raw.replace(bytes.fromhex(before),bytes.fromhex(after),1))
+
     def test_http_gate_rejects_alias_clobbers_and_mismatched_fields(self):
         raw=self.http_fragment()
         changes=[('4889d9','4989df'),  # Normalization overwrites state.
@@ -300,7 +412,7 @@ class OutlinedTests(unittest.TestCase):
             self.http_layout(variant)
 
     def outlined_image(self, gates=1, unknown_caller=False, missing_endpoint=False,
-                       changed_enum=False, duplicate_outer=False):
+                       changed_enum=False, duplicate_outer=False, signed_enum=False):
         """Sparse real outer fragment plus synthetic protocol-scoped gates.
 
         No log, instrumentation or function-name strings exist in this image.
@@ -332,6 +444,8 @@ class OutlinedTests(unittest.TestCase):
         references=[]
         for _ in range(gates):
             raw=self.http_fragment()
+            if signed_enum:
+                raw=raw.replace(bytes.fromhex('480f43c1'),bytes.fromhex('480f4dc1'))
             if changed_enum:
                 raw=raw.replace(bytes.fromhex('4883e904b801000000'),
                                 bytes.fromhex('4881e909000000b802000000'))
@@ -371,15 +485,17 @@ class OutlinedTests(unittest.TestCase):
 
     def test_locator_needs_no_log_or_function_names(self):
         for changed_enum in (False,True):
-            s=self.outlined_image(changed_enum=changed_enum)
-            self.assertEqual(len(s['http_sites']),1)
-            self.assertEqual(len(replacements(s,dict(max_retries=20,interval_ms=1000))),5)
+            for signed_enum in (False,True):
+                s=self.outlined_image(changed_enum=changed_enum,signed_enum=signed_enum)
+                self.assertEqual(len(s['http_sites']),1)
+                self.assertEqual(len(replacements(s,dict(max_retries=20,interval_ms=1000))),5)
 
     def test_locator_handles_multiple_proven_responses_gates(self):
-        s=self.outlined_image(gates=2)
-        patches=replacements(s,dict(max_retries=20,interval_ms=1000))
-        self.assertEqual(len(patches),6)
-        self.assertEqual({p[0] for p in patches[-2:]},{g['offset'] for g in s['http_sites']})
+        for signed_enum in (False,True):
+            s=self.outlined_image(gates=2,signed_enum=signed_enum)
+            patches=replacements(s,dict(max_retries=20,interval_ms=1000))
+            self.assertEqual(len(patches),6)
+            self.assertEqual({p[0] for p in patches[-2:]},{g['offset'] for g in s['http_sites']})
 
     def test_locator_refuses_unproven_gate_even_when_another_gate_is_valid(self):
         for options in (dict(gates=2,unknown_caller=True),dict(missing_endpoint=True),dict(duplicate_outer=True)):

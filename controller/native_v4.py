@@ -27,7 +27,19 @@ def only(values, label):
     return values[0]
 
 
-def classifier_flow(prefix):
+def register_families():
+    """Architectural aliases, including partial writes to a live register."""
+    import capstone.x86_const as x
+    names = [('RAX','EAX','AX','AL','AH'), ('RBX','EBX','BX','BL','BH'),
+             ('RCX','ECX','CX','CL','CH'), ('RDX','EDX','DX','DL','DH'),
+             ('RSI','ESI','SI','SIL'), ('RDI','EDI','DI','DIL'),
+             ('RBP','EBP','BP','BPL'), ('RSP','ESP','SP','SPL')]
+    names += [(f'R{n}',f'R{n}D',f'R{n}W',f'R{n}B') for n in range(8,16)]
+    return {getattr(x,'X86_REG_'+group[0]):
+            tuple(getattr(x,'X86_REG_'+name) for name in group) for group in names}
+
+
+def classifier_flow(prefix, none_value=SENTINEL):
     """Prove BT uses the normalized error tag and returns the None sentinel.
 
     Track volatile register aliases so enum numbering and register allocation
@@ -70,7 +82,7 @@ def classifier_flow(prefix):
                     or index[:3] != ('select-sign', ('tag',), ('untagged',))
                     or index[3][0] != 'constant' or not 0 <= index[3][1] < 64):
                 raise ValueError('terminal mask is not indexed by normalized error tag')
-            if registers.get('rdx') != ('constant', SENTINEL):
+            if registers.get('rdx') != ('constant', none_value):
                 raise ValueError('terminal result is not None duration')
             continue
         if i.mnemonic == 'test':
@@ -99,7 +111,7 @@ def classifier_flow(prefix):
         registers[target] = value
 
 
-def classifier(ins):
+def classifier(ins, none_value=SENTINEL):
     """Return a relocatable prefix ending at the native terminal-mask BT."""
     import capstone.x86_const as x
     # This helper uses the Windows x64 RCX(error), RDX(attempt) ABI.
@@ -121,7 +133,7 @@ def classifier(ins):
                 raise ValueError('classifier reads outside error tag')
         if any(r not in volatile and r != x.X86_REG_EFLAGS for r in i.regs_access()[1]):
             raise ValueError('classifier modifies nonvolatile register')
-    classifier_flow(prefix)
+    classifier_flow(prefix, none_value)
     jump, epilogue, ret = ins[end+1:end+4]
     if (jump.mnemonic != 'jae' or jump.operands[0].type != 2
             or epilogue.mnemonic != 'add' or epilogue.op_str != ins[0].op_str
@@ -161,6 +173,33 @@ def safe_ranges(ins, ranges, data, off):
                 check(i.address,target)
 
 
+def duration_branch(ins, call_index):
+    """Derive the Option discriminant and both successors at the call site.
+
+    A nanosecond value is below 1e9; None must be outside that range. Its
+    encoding is a compiler choice, not the numeric limit of Duration itself.
+    The classifier must independently return this same value on its None path.
+    """
+    import capstone.x86_const as x
+    n = call_index + 1
+    while ins[n].mnemonic == 'nop':
+        n += 1
+    compare, jump = ins[n:n+2]
+    if not (compare.mnemonic == 'cmp' and reg(compare.operands[0], x.X86_REG_EDX)
+            and compare.operands[1].type == 2
+            and jump.mnemonic in ('je', 'jne') and jump.operands[0].type == 2):
+        raise ValueError('duration option branch changed')
+    none_value = compare.operands[1].imm & 0xffffffff
+    if none_value < SENTINEL:
+        raise ValueError('None discriminant overlaps valid nanoseconds')
+    taken, fallthrough = jump.operands[0].imm, jump.address + jump.size
+    present, absent = (taken, fallthrough) if jump.mnemonic == 'jne' else (fallthrough, taken)
+    boundaries = {i.address for i in ins}
+    if present == absent or present not in boundaries or absent not in boundaries:
+        raise ValueError('duration option successors are not distinct instruction boundaries')
+    return none_value, present, absent
+
+
 def outer(ins, call_index, helper, data, off):
     import capstone.x86_const as x
     call=ins[call_index]
@@ -174,15 +213,18 @@ def outer(ins, call_index, helper, data, off):
     if state in (x.X86_REG_RBP,x.X86_REG_RSP):
         raise ValueError('stack spill is not sampling state')
     next_attempt=before.operands[0].mem.disp
-    n=call_index+1
-    while ins[n].mnemonic=='nop': n+=1
-    compare,jump=ins[n:n+2]
-    if not (compare.mnemonic=='cmp' and reg(compare.operands[0],x.X86_REG_EDX)
-            and compare.operands[1].type==2 and compare.operands[1].imm==SENTINEL
-            and jump.mnemonic=='jne' and jump.operands[0].type==2):
-        raise ValueError('duration option branch changed')
+    none_value, present, absent = duration_branch(ins, call_index)
+    # Recheck the relocatable prefix against the caller. Direct users of outer
+    # must not accidentally combine a classifier from a different ABI.
+    import capstone
+    decoder = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    decoder.detail = True
+    prefix = list(decoder.disasm(helper, 0))
+    if not prefix or sum(i.size for i in prefix) != len(helper) or prefix[-1].mnemonic != 'bt':
+        raise ValueError('incomplete classifier prefix')
+    classifier_flow(prefix, none_value)
     addresses={i.address:k for k,i in enumerate(ins)}
-    resume=addresses[jump.operands[0].imm]
+    resume=addresses[present]
     reload=ins[resume]
     if not (reload.mnemonic=='mov' and reload.operands[0].type==1
             and mem(reload.operands[1],x.X86_REG_RBP)):
@@ -244,12 +286,50 @@ def outer(ins, call_index, helper, data, off):
     if not any(i.mnemonic=='je' and i.operands[0].type==2 and i.operands[0].imm==bounded.address
                for i in ins[resume+7:k]):
         raise ValueError('missing bounded connection edge')
+    # Block scheduling may put the None/cleanup branch between the connection
+    # exception and bounded retry blocks. Leave that live block untouched.
+    connection_end = absent if connection.address < absent < bounded.address else bounded.address
+    # Scheduling can move the bounded call's R8(error) reload into the skipped
+    # connection block. Replay only a stack load proven to be the same error
+    # passed to the classifier; copying the classifier alone clobbers R8.
+    families = register_families()
+    def writes(i, register):
+        return bool(set(i.regs_access()[1]).intersection(families[register]))
+    setup = ins[k:k+18]
+    first_call = next((n for n,i in enumerate(setup) if i.mnemonic=='call'),len(setup))
+    skipped = ins[resume+7:addresses[connection_end]]
+    reloads = [(n,i) for n,i in enumerate(skipped) if i.mnemonic=='mov'
+               and reg(i.operands[0],x.X86_REG_R8) and i.operands[0].size==8
+               and mem(i.operands[1],x.X86_REG_RBP) and i.operands[1].size==8]
+    bounded_reload = b''
+    if reloads and not any(writes(i,x.X86_REG_R8) for i in setup[:first_call]):
+        n,reload = only(reloads,'bounded error reload')
+        bridge = next((j for j in range(n+1,len(skipped)) if skipped[j].mnemonic=='je'
+                       and skipped[j].operands[0].type==2
+                       and skipped[j].operands[0].imm==bounded.address),None)
+        argument = ins[call_index-1]
+        if not (bridge is not None and argument.mnemonic=='mov'
+                and reg(argument.operands[0],x.X86_REG_RCX)
+                and argument.operands[1].type==1 and argument.operands[1].size==8
+                and not any(writes(i,x.X86_REG_R8) or i.mnemonic=='call' for i in skipped[n+1:bridge])):
+            raise ValueError('bounded error argument flow changed')
+        error = argument.operands[1].reg
+        source = next((i for i in reversed(ins[max(0,call_index-30):call_index-1])
+                       if writes(i,error)),None)
+        if not (source and source.mnemonic=='mov' and reg(source.operands[0],error)
+                and source.operands[0].size==8
+                and mem(source.operands[1],x.X86_REG_RBP,reload.operands[1].mem.disp)
+                and source.operands[1].size==8):
+            raise ValueError('bounded error reload disagrees with classifier argument')
+        bounded_reload = bytes(reload.bytes)
     ranges=[(call.address,call.address+call.size),(init.address,init.address+init.size),
-            (lnano.address,lnano.address+lnano.size),(connection.address,bounded.address)]
+            (lnano.address,lnano.address+lnano.size),(connection.address,connection_end)]
     safe_ranges(ins,ranges,data,off)
     return dict(call=call.address,continuation=call.address+call.size,
                 init=init.address,init_size=init.size,deadline=lnano.address,deadline_size=lnano.size,
-                connection=connection.address,bounded=bounded.address,prefix=helper)
+                connection=connection.address,connection_end=connection_end,
+                bounded=bounded.address,bounded_reload=bounded_reload,
+                prefix=helper,none_value=none_value)
 
 
 def http_budget(ins, index, data, off):
@@ -264,13 +344,7 @@ def http_budget(ins, index, data, off):
     load, compare, exhausted, copy, subtract, default, select, adjust, limit, reject = ins[index-1:index+9]
     # Include every subregister: a write to EDI/DI/DIL also destroys RDI's
     # counter value, even though Capstone reports a different register ID.
-    names = [('RAX','EAX','AX','AL','AH'), ('RBX','EBX','BX','BL','BH'),
-             ('RCX','ECX','CX','CL','CH'), ('RDX','EDX','DX','DL','DH'),
-             ('RSI','ESI','SI','SIL'), ('RDI','EDI','DI','DIL'),
-             ('RBP','EBP','BP','BPL'), ('RSP','ESP','SP','SPL')]
-    names += [(f'R{n}',f'R{n}D',f'R{n}W',f'R{n}B') for n in range(8,16)]
-    families = {getattr(x,'X86_REG_'+group[0]):
-                tuple(getattr(x,'X86_REG_'+name) for name in group) for group in names}
+    families = register_families()
     def writes(i, register):
         return bool(set(i.regs_access()[1]).intersection(families[register]))
     def overlaps(a, b):
@@ -295,7 +369,8 @@ def http_budget(ins, index, data, off):
         raise ValueError('HTTP exhausted branch outside error path')
 
     # Preserve the native tag classification after the budget gate. Its SUB
-    # flags must feed CMOVAE directly; MOV does not modify those flags.
+    # flags must feed the signed/unsigned conditional move directly; MOV does
+    # not modify those flags. Both native classifications remain untouched.
     if not (copy.mnemonic == 'mov' and all(o.type == 1 and o.size == 8 for o in copy.operands)
             and subtract.mnemonic == 'sub' and reg(subtract.operands[0], copy.operands[0].reg)
             and subtract.operands[0].size == 8 and subtract.operands[1].type == 2
@@ -303,7 +378,7 @@ def http_budget(ins, index, data, off):
             and default.mnemonic == 'mov' and default.operands[0].type == 1
             and default.operands[0].size == 4 and default.operands[1].type == 2
             and 0 <= default.operands[1].imm <= 0xffffffff
-            and select.mnemonic == 'cmovae' and all(o.type == 1 and o.size == 8 for o in select.operands)
+            and select.mnemonic in ('cmovae', 'cmovge') and all(o.type == 1 and o.size == 8 for o in select.operands)
             and reg(select.operands[1], copy.operands[0].reg)):
         raise ValueError('HTTP error normalization changed')
     # Capstone supplies the architectural 32-bit alias without relying on a
@@ -514,24 +589,25 @@ def locate_outlined(data, function, off, va, refs, cs):
     candidates=[]
     # A cheap scan narrows decoding to calls returning an Option<Duration>.
     pattern=(rb'\xe8....(?:\x90|\x66\x90|\x0f\x1f\x00|\x0f\x1f\x40.){0,4}'
-             rb'\x81\xfa\x00\xca\x9a\x3b(?:\x75.|\x0f\x85....)')
+             rb'(?:\x81\xfa....|\x83\xfa.)(?:[\x74\x75].|\x0f[\x84\x85]....)')
     for match in re.finditer(pattern,data,re.S):
         try:
             _,ins=function(match.start())
             n=next(n for n,i in enumerate(ins) if i.address==va(match.start()) and i.mnemonic=='call')
+            none_value, _, _ = duration_branch(ins, n)
             target=ins[n].operands[0].imm
             bounds,helper=function(off(target))
             if target!=bounds[0]: continue
-            candidates.append(outer(ins,n,classifier(helper),data,off))
+            candidates.append(outer(ins,n,classifier(helper,none_value),data,off))
         except (ValueError,KeyError,IndexError,StopIteration):
             continue
     result=only(candidates,'sampling policy')
     http={}
     graph=ResponsesCallGraph(data,function,off,va,refs)
-    # SUB r64, imm8/imm32; MOV r32, imm32; CMOVAE r64, r64. The
+    # SUB r64, imm8/imm32; MOV r32, imm32; CMOVAE/CMOVGE r64, r64. The
     # constants are enum inputs, not identities of a particular release.
     pattern=(rb'[\x48-\x4f](?:\x83[\xe8-\xef].|\x81[\xe8-\xef]....|\x2d....)'
-             rb'[\x40-\x41]?[\xb8-\xbf]....[\x48-\x4f]\x0f\x43[\xc0-\xff]')
+             rb'[\x40-\x41]?[\xb8-\xbf]....[\x48-\x4f]\x0f[\x43\x4d][\xc0-\xff]')
     for match in re.finditer(pattern,data,re.S):
         try:
             bounds,ins=function(match.start())
@@ -564,16 +640,18 @@ def jmp(source,target,opcode=b'\xe9'):
 
 def replacements(s,p):
     cave=s['connection']
-    code=jmp(cave,s['bounded'])
+    code=s.get('bounded_reload',b'')
+    code+=jmp(cave+len(code),s['bounded'])
+    classifier_entry=cave+len(code)
     code+=s['prefix']
     code+=jmp(cave+len(code),s['continuation'],b'\x0f\x82')  # native terminal bit: return None
     code+=b'\xb8'+struct.pack('<I',p['interval_ms']//1000)+b'\xba'+struct.pack('<I',p['interval_ms']%1000*1_000_000)
     code+=jmp(cave+len(code),s['continuation'])
     offsets=s['offsets']
-    patches=[(offsets['call'],5,jmp(s['call'],cave+5),'model_outer_policy'),
-            (offsets['connection'],s['bounded']-cave,code,'bounded_connection_and_native_classifier'),
+    patches=[(offsets['call'],5,jmp(s['call'],classifier_entry),'model_outer_policy'),
+            (offsets['connection'],s.get('connection_end',s['bounded'])-cave,code,'bounded_connection_and_native_classifier'),
             (offsets['init'],s['init_size'],b'\xb8'+struct.pack('<I',p['max_retries']),'model_outer_budget'),
-            (offsets['deadline'],s['deadline_size'],b'\xb9'+struct.pack('<I',SENTINEL),'ignore_server_deadline')]
+            (offsets['deadline'],s['deadline_size'],b'\xb9'+struct.pack('<I',s.get('none_value',SENTINEL)),'ignore_server_deadline')]
     sites=s.get('http_sites',[dict(offset=offsets['http'],http_size=s.get('http_size',7))])
     for n,site in enumerate(sites):
         label='model_http_budget' if len(sites)==1 else f'model_http_budget_{n+1}'
