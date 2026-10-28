@@ -74,7 +74,7 @@ def probe(exe, retries, *, stream_retries=0, mode="http", debug_patches=None, re
             env = {k: v for k, v in os.environ.items()
                    if not k.startswith(("OPENAI_", "AZURE_OPENAI_", "CODEX_"))}
             env.update(CODEX_HOME=directory, CODEX_LOCAL_PROBE_KEY="not-a-real-key",
-                       NO_PROXY="127.0.0.1,localhost")
+                       NO_PROXY="127.0.0.1,localhost", RUST_LOG="warn")
             args = [exe, "exec", "--strict-config", "--skip-git-repo-check", "--ephemeral",
                     "--ignore-rules", "--sandbox", "read-only", "--json", "Reply OK."]
             start = time.monotonic()

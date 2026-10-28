@@ -1,9 +1,10 @@
 """Loopback acceptance suite used for each newly encountered engine build."""
-import contextlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import sys
 import tempfile
-from .core import Manager, ROOT, SUPPORTED_SHA256, profile, sha, unb64, exclusive_binary, ControllerError
+import time
+from .core import Manager, ROOT, SUPPORTED_SHA256, profile, sha, unb64, exclusive_binary, ControllerError, build_plan, patched_bytes
 
 REQUIRED_CASES = ('zero-budget','http-fixed','http-429','quota-terminal','http-529',
                   'http-retry-after','stream-interrupted','stream-server-delay',
@@ -15,72 +16,52 @@ REQUIRED_CASES = ('zero-budget','http-fixed','http-429','quota-terminal','http-5
 JITTER_CASES = ('jitter-http','jitter-cross-second','jitter-millisecond')
 
 
-def run_suite(data, owner):
-    sys.path.insert(0,str(ROOT/'research'))
-    from probe_retries import probe
-    work = owner.state / '.verification'
-    work.mkdir(parents=True,exist_ok=True)
-    from .native import locate
-    jitter_supported = (sha(data) != SUPPORTED_SHA256 and
-                        locate(data, ControllerError)['family'] == 'responses-sampling-x64-outlined')
-    report={'cases':[], 'supports_jitter':jitter_supported}
-    with tempfile.TemporaryDirectory(dir=work,prefix='native-') as directory, contextlib.ExitStack() as cleanup:
-        path=Path(directory)/'codex.exe'
-        path.write_bytes(data)
-        manager=Manager(Path(directory)/'tool',verify_writes=False)
-        cleanup.callback(manager.close)
-        original_classification={}
-        for status in (400,401,403,404):
-            result=probe(str(path),0,stream_retries=1,error_status=status)
-            assert not result['timed_out'] and result['exit_code']==1
-            assert result['requests'] in (1,2), f'baseline HTTP {status}: unexpected budget'
-            original_classification[status]=result['requests']>1
-        def case(name,count,delay,expected,success=False,**kwargs):
-            manager.apply(path,profile(count,delay))
-            result=probe(str(path),4,stream_retries=5,succeed=success,**kwargs)
-            assert not result['timed_out'], f'{name}: timed out'
-            assert result['requests']==expected, f"{name}: {result['requests']} requests, expected {expected}"
-            assert result['exit_code']==(0 if success else 1), f'{name}: unexpected exit'
-            if float(delay):
-                assert all(float(delay)-0.04<=t<=float(delay)+0.5 for t in result['intervals_seconds']), f'{name}: interval mismatch'
-            # Keep evidence compact; no prompts, credentials or request bodies.
-            report['cases'].append(dict(name=name,passed=True,retries=count,interval_seconds=delay,
-                                        requests=result['requests'],intervals_seconds=result['intervals_seconds'],
-                                        interface=result['interface'],exit_code=result['exit_code']))
-            owner.logger.info('Native case passed: %s requests=%s',name,expected)
-        case('zero-budget',0,'0.5',1)
-        case('http-fixed',3,'0.5',4)
-        case('http-429',3,'0.125',4,error_status=429)
-        case('quota-terminal',3,'0.125',1,error_status=429,error_code='insufficient_quota')
-        case('http-529',2,'0.125',3,error_status=529)
-        case('http-retry-after',2,'0.125',3,retry_after=4)
-        case('stream-interrupted',3,'0.125',4,mode='stream')
-        case('stream-server-delay',2,'0.125',3,mode='stream-rate-limit')
-        case('connection-failure',2,'0.125',3,mode='disconnect')
-        case('success-after-failures',3,'0.125',3,success=True,stop_after=2)
-        case('app-server-success',3,'0.125',3,success=True,stop_after=2,interface='app-server')
-        case('app-server-budget',3,'0.125',4,interface='app-server',error_status=429)
-        case('whole-seconds',2,'1.25',3)
-        case('thousand-retries',1000,'0',1001,stop_after=1100,timeout=90)
-        for status,retryable in original_classification.items():
-            case(f'http-{status}-classification',2,'0.125',3 if retryable else 1,error_status=status)
-            report['cases'][-1]['original_retryable']=retryable
-        case('millisecond-fixed',3,'0.001',4)
-        jitter_cases = [('jitter-http',100,70,'exec'), ('jitter-cross-second',1000,70,'app-server'),
-                        ('jitter-millisecond',5,4,'exec')] if jitter_supported else []
-        for name,base,spread,interface in jitter_cases:
-            manager.apply(path,profile(8,base,spread,unit='ms'))
-            result=probe(str(path),4,stream_retries=5,stop_after=10,interface=interface)
-            delays=result['selected_delays_ms']
-            assert not result['timed_out'] and result['exit_code']==1 and result['requests']==9, name
-            assert len(delays)==8 and all(base-spread<=v<=base+spread for v in delays), f'{name}: chosen wait outside range'
-            assert len(set(delays))>1, f'{name}: no observed variation'
-            assert all(max(0,wait/1000-.04)<=actual<=wait/1000+.5
-                       for wait,actual in zip(delays,result['intervals_seconds'])), f'{name}: interval mismatch'
-            report['cases'].append(dict(name=name,passed=True,profile=profile(8,base,spread,unit='ms'),
-                                       requests=result['requests'],selected_delays_ms=delays,
-                                       intervals_seconds=result['intervals_seconds'],interface=interface))
-            owner.logger.info('Native case passed: %s requests=%s',name,result['requests'])
+def _stage(data, path, settings=None):
+    """Immutable probe image, generated by the same checked plan as apply."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = data if settings is None else patched_bytes(data, build_plan(data, settings))
+    digest = sha(image)
+    path.write_bytes(image)
+    if sha(path.read_bytes()) != digest:
+        raise ControllerError('临时验收副本写入后校验失败。')
+    return path, digest
+
+
+def _case(probe, path, name, settings, expected, success, options, logger):
+    started = time.perf_counter()
+    result = probe(str(path), 4, stream_retries=5, succeed=success, **options)
+    assert not result['timed_out'], f'{name}: timed out'
+    assert result['requests'] == expected, f"{name}: {result['requests']} requests, expected {expected}"
+    assert result['exit_code'] == (0 if success else 1), f'{name}: unexpected exit'
+    intervals = result['intervals_seconds']
+    assert len(intervals) == expected-1, f'{name}: missing request intervals'
+    base, spread = settings['interval_ms'], settings.get('jitter_ms', 0)
+    if spread:
+        delays = result['selected_delays_ms']
+        assert len(delays) == expected-1 and all(base-spread <= v <= base+spread for v in delays), f'{name}: chosen wait outside range'
+        assert len(set(delays)) > 1, f'{name}: no observed variation'
+        assert all(max(0,wait/1000-.04) <= actual <= wait/1000+.5
+                   for wait,actual in zip(delays,intervals)), f'{name}: interval mismatch'
+    elif base:
+        assert all(base/1000-.04 <= t <= base/1000+.5 for t in intervals), f'{name}: interval mismatch'
+    row = dict(name=name, passed=True, retries=settings['max_retries'],
+               interval_seconds=f'{base/1000:g}', profile=settings, requests=result['requests'],
+               intervals_seconds=intervals, interface=result['interface'], exit_code=result['exit_code'],
+               seconds=round(time.perf_counter()-started,3))
+    if spread:
+        row['selected_delays_ms'] = result['selected_delays_ms']
+    logger.info('Native case passed: %s requests=%s seconds=%s', name, expected, row['seconds'])
+    return row
+
+
+def _recovery(data, directory, expected_digest):
+    """Exercise real journaled apply/restore on a separate, never-running file."""
+    started = time.perf_counter()
+    path, _ = _stage(data, directory/'codex.exe')
+    manager = Manager(directory/'tool', verify_writes=False)
+    try:
+        manager.apply(path, profile(3,'.125'))
+        assert sha(path.read_bytes()) == expected_digest, 'staged image differs from journaled apply'
         manager.restore(path)
         assert sha(path.read_bytes())==sha(data),'restore mismatch'
         assert not manager.restore(path)['changed'],'restore is not idempotent'
@@ -115,7 +96,95 @@ def run_suite(data, owner):
             stream.write(last)
         manager.restore(path)
         assert sha(path.read_bytes())==sha(data),'final restore mismatch'
-        report['interrupted_write_recovery']=True
-        report['unrelated_change_refused']=True
-        report['restored_sha256']=sha(path.read_bytes())
+        return dict(interrupted_write_recovery=True, unrelated_change_refused=True,
+                    restored_sha256=sha(path.read_bytes()), seconds=round(time.perf_counter()-started,3))
+    finally:
+        manager.close()
+
+
+def run_suite(data, owner):
+    sys.path.insert(0,str(ROOT/'research'))
+    from probe_retries import probe
+    from .native import locate
+    started = time.perf_counter()
+    work = owner.state/'.verification'
+    work.mkdir(parents=True,exist_ok=True)
+    jitter_supported = (sha(data) != SUPPORTED_SHA256 and
+                        locate(data, ControllerError)['family'] == 'responses-sampling-x64-outlined')
+    report = dict(cases=[], supports_jitter=jitter_supported, max_workers=4)
+    with tempfile.TemporaryDirectory(dir=work,prefix='native-') as temporary:
+        directory = Path(temporary)
+        original = _stage(data, directory/'original'/'codex.exe')
+        staged = {}
+        staging_seconds = 0
+        def image(settings):
+            nonlocal staging_seconds
+            key = tuple(sorted(settings.items()))
+            if key not in staged:
+                before = time.perf_counter()
+                staged[key] = _stage(data, directory/f'profile-{len(staged)}'/'codex.exe', settings)
+                staging_seconds += time.perf_counter()-before
+            return staged[key]
+
+        pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='retry-acceptance')
+        pending = []
+        try:
+            baselines = {status:pool.submit(probe,str(original[0]),0,stream_retries=1,error_status=status)
+                         for status in (400,401,403,404)}
+            original_classification = {}
+            for status,future in baselines.items():
+                result = future.result()
+                assert not result['timed_out'] and result['exit_code'] == 1
+                assert result['requests'] in (1,2), f'baseline HTTP {status}: unexpected budget'
+                original_classification[status] = result['requests'] > 1
+            recovery = pool.submit(_recovery, data, directory/'recovery', image(profile(3,'.125'))[1])
+            pending.append(recovery)
+            def case(name,count,delay,expected,success=False,jitter='0',**options):
+                settings = profile(count,delay,jitter)
+                future = pool.submit(_case,probe,image(settings)[0],name,settings,expected,success,options,owner.logger)
+                pending.append(future)
+
+            # Start the longest probe early; every scenario still runs in full.
+            case('thousand-retries',1000,'0',1001,stop_after=1100,timeout=90)
+            case('zero-budget',0,'0.5',1)
+            case('http-fixed',3,'0.5',4)
+            case('http-429',3,'0.125',4,error_status=429)
+            case('quota-terminal',3,'0.125',1,error_status=429,error_code='insufficient_quota')
+            case('http-529',2,'0.125',3,error_status=529)
+            case('http-retry-after',2,'0.125',3,retry_after=4)
+            case('stream-interrupted',3,'0.125',4,mode='stream')
+            case('stream-server-delay',2,'0.125',3,mode='stream-rate-limit')
+            case('connection-failure',2,'0.125',3,mode='disconnect')
+            case('success-after-failures',3,'0.125',3,success=True,stop_after=2)
+            case('app-server-success',3,'0.125',3,success=True,stop_after=2,interface='app-server')
+            case('app-server-budget',3,'0.125',4,interface='app-server',error_status=429)
+            case('whole-seconds',2,'1.25',3)
+            for status,retryable in original_classification.items():
+                case(f'http-{status}-classification',2,'0.125',3 if retryable else 1,error_status=status)
+            case('millisecond-fixed',3,'0.001',4)
+            if jitter_supported:
+                case('jitter-http',8,'.1',9,jitter='.07',stop_after=10)
+                case('jitter-cross-second',8,'1',9,jitter='.07',stop_after=10,interface='app-server')
+                case('jitter-millisecond',8,'.005',9,jitter='.004',stop_after=10)
+            for future in as_completed(pending):
+                result = future.result()
+                if future is recovery:
+                    report.update(result)
+                    report['recovery_seconds'] = report.pop('seconds')
+                else:
+                    report['cases'].append(result)
+        finally:
+            # Drain running probes before deleting any image. Worker Job Object
+            # cancellation still terminates this process and all its children.
+            pool.shutdown(wait=True,cancel_futures=True)
+        for path,digest in [original,*staged.values()]:
+            assert sha(path.read_bytes()) == digest, 'probe changed its immutable engine'
+        report['staged_profiles'] = len(staged)
+        report['staging_seconds'] = round(staging_seconds,3)
+    order = REQUIRED_CASES+JITTER_CASES
+    report['cases'].sort(key=lambda row:order.index(row['name']))
+    for row in report['cases']:
+        if row['name'].endswith('-classification'):
+            row['original_retryable'] = original_classification[int(row['name'].split('-')[1])]
+    report['seconds'] = round(time.perf_counter()-started,3)
     return report

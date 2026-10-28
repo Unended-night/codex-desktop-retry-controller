@@ -55,7 +55,10 @@ def replay(exe, directory, stop_after=None, *, stream_retries=5, message=MESSAGE
             'env_key = "CODEX_LOCAL_PROBE_KEY"\nwire_api = "responses"\n'
             f'request_max_retries = 4\nstream_max_retries = {stream_retries}\nsupports_websockets = false\n',encoding='utf-8')
         env={k:v for k,v in os.environ.items() if not k.startswith(('OPENAI_','AZURE_OPENAI_','CODEX_'))}
-        env.update(CODEX_HOME=str(directory),CODEX_LOCAL_PROBE_KEY='not-a-real-key',NO_PROXY='127.0.0.1,localhost')
+        # app-server does not emit the required retry warnings by default.
+        # Keep acceptance independent of the GUI launcher's inherited filter.
+        env.update(CODEX_HOME=str(directory),CODEX_LOCAL_PROBE_KEY='not-a-real-key',
+                   NO_PROXY='127.0.0.1,localhost',RUST_LOG='warn')
         stdout,stderr,code,timed_out=run(str(exe),str(directory),env,timeout)
         notices=[]
         for line in stdout.splitlines():
