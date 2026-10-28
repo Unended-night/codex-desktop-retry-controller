@@ -15,6 +15,7 @@ from controller.core import Manager, ROOT, atomic_json, detect_installation, now
 from controller.verification import cached, cache_path
 sys.path.insert(0,str(ROOT/'research'))
 from appserver_probe import run
+from research.probe_retries import retry_delays
 
 MESSAGE='Your requests to gpt-6-astra for gpt-6-astra in eastus2 have exceeded token rate limit.'
 
@@ -48,6 +49,7 @@ def replay(exe, directory, stop_after=None, *, stream_retries=5, message=MESSAGE
     try:
         directory.mkdir()
         (directory/'config.toml').write_text('model = "retry-probe-model"\nmodel_provider = "probe"\n'
+            '[features]\nplugins = false\n'
             '[model_providers.probe]\nname = "loopback probe"\n'
             f'base_url = "http://127.0.0.1:{server.server_port}/v1"\n'
             'env_key = "CODEX_LOCAL_PROBE_KEY"\nwire_api = "responses"\n'
@@ -63,6 +65,7 @@ def replay(exe, directory, stop_after=None, *, stream_retries=5, message=MESSAGE
         return dict(requests=len(events),intervals_seconds=[round(b-a,3) for a,b in zip(events,events[1:])],
                     reconnects=re.findall(r'Reconnecting\.\.\. \d+/\d+',stdout),
                     sampling_retries=re.findall(r'retrying sampling request \(([^)]+)\)',stderr),
+                    selected_delays_ms=retry_delays(stderr),
                     error_notices=notices,exact_error_seen=message in stdout or message in stderr,
                     turn_exit_code=code,timed_out=timed_out)
     finally:

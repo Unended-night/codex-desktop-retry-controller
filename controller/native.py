@@ -72,6 +72,31 @@ def locate(data, error):
         return copy.deepcopy(_analysis_result)
 
 
+def _relative_reference_candidates(data, regions, target):
+    """Prefilter rel32 references in C regex code; decoding still proves them.
+
+    In a 64 KiB block, at most two high words of a displacement can reach the
+    target. Advancing one byte preserves overlapping opcodes and block edges.
+    Regions use the same file-to-VA mapping as the instruction decoder.
+    """
+    for start, end, address in regions:
+        for block in range(start, end, 65536):
+            stop = min(block + 65536, end)
+            def suffix(size):
+                lo = max(-0x80000000, target - (address + stop - 1 - start) - size)
+                hi = min(0x7fffffff, target - (address + block - start) - size)
+                return b'(?:' + b'|'.join(re.escape(struct.pack('<H', n & 0xffff))
+                    for n in range(lo >> 16, (hi >> 16) + 1)) + b')' if lo <= hi else b'(?!)'
+            pattern = (rb'([\xe8\xe9]..' + suffix(5)
+                       + rb'|[\x48-\x4f]\x8d[\x05\x0d\x15\x1d\x25\x2d\x35\x3d]..'
+                       + suffix(7) + rb')')
+            matcher = re.compile(pattern, re.S)
+            match = matcher.search(data, block, min(len(data), stop+6))
+            while match is not None and match.start() < stop:
+                yield match.start(), len(match[1])
+                match = matcher.search(data, match.start()+1, min(len(data), stop+6))
+
+
 def _locate(data, error):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'research/.deps'))
     try:
@@ -87,6 +112,9 @@ def _locate(data, error):
         # Map raw sections once. Call-graph queries otherwise ask pefile to
         # normalize every section for each possible relative-call byte.
         va = _file_address_map(pe, len(data))
+        regions = [(0, min(pe.OPTIONAL_HEADER.SizeOfHeaders, len(data)), base)]
+        regions += [(s.PointerToRawData, min(len(data), s.PointerToRawData+s.SizeOfRawData),
+                     base+s.VirtualAddress) for s in pe.sections if s.SizeOfRawData]
         section = next(s for s in pe.sections if s.Name.rstrip(b'\0') == b'.pdata')
         functions = list(struct.iter_unpack('<III', data[section.PointerToRawData:section.PointerToRawData+section.Misc_VirtualSize]))
         starts = [f[0] for f in functions]
@@ -94,6 +122,7 @@ def _locate(data, error):
         cs.detail = True
         decoded_index, decoded_result = None, None
         reference_results = {}
+        light_references = {}
         def off(va):
             return pe.get_offset_from_rva(va-base)
         def function(offset):
@@ -125,6 +154,33 @@ def _locate(data, error):
                         except (ValueError,pefile.PEFormatError): pass
             reference_results[key] = False
             return False
+        def has_reference(offset, needle):
+            address = va(offset)-base
+            index = bisect.bisect_right(starts, address)-1
+            if index < 0 or not functions[index][0] <= address < functions[index][1]:
+                raise ValueError('outside function')
+            key = (index, needle)
+            if key not in light_references:
+                a, z, _ = functions[index]
+                raw = data[off(base+a):off(base+z-1)+1]
+                found = False
+                for at, size, _, operands in cs.disasm_lite(raw, base+a):
+                    if 'rip' not in operands:
+                        continue
+                    instruction = next(cs.disasm(raw[at-base-a:at-base-a+size], at))
+                    for op in instruction.operands:
+                        if op.type == capstone.CS_OP_MEM and instruction.reg_name(op.mem.base) == 'rip':
+                            try:
+                                target = off(at+size+op.mem.disp)
+                                found = data[target:target+len(needle)] == needle
+                            except (ValueError, pefile.PEFormatError):
+                                pass
+                            if found:
+                                break
+                    if found:
+                        break
+                light_references[key] = found
+            return light_references[key]
         def unique(pattern, start=0, end=None, label='instruction'):
             hits=list(re.finditer(pattern,data[start:end],re.S))
             if len(hits)!=1: raise ValueError(f'{label}: expected one pattern, found {len(hits)}')
@@ -137,7 +193,9 @@ def _locate(data, error):
                     for name,pat in families.items() for m in re.finditer(pat,data,re.S)]
         if not candidates:
             from .native_v4 import locate_outlined
-            return locate_outlined(data, function, off, va, refs, cs)
+            return locate_outlined(data, function, off, va, refs, cs,
+                has_reference=has_reference,
+                reference_candidates=lambda target: _relative_reference_candidates(data, regions, target))
         if len(candidates)!=1:
             raise ValueError(f'model error classifier: expected one pattern, found {len(candidates)}')
         family,classify=candidates[0]
@@ -210,6 +268,8 @@ def replacements(data,p,error):
     if s['family']=='responses-sampling-x64-outlined':
         from .native_v4 import replacements as outlined_replacements
         return outlined_replacements(s,p)
+    if p.get('jitter_ms', 0):
+        raise error('此旧版重试结构尚未支持随机扰动，可使用固定等待。')
     policy=s['policy_prefix']+struct.pack('<I',s['budget'])+struct.pack('<I',p['max_retries'])
     policy+=b'\xb8'+struct.pack('<I',p['interval_ms']//1000)+b'\xba'+struct.pack('<I',p['interval_ms']%1000*1000000)
     policy+=b'\xe9'+struct.pack('<i',s['resume']-(s['policy_va']+len(policy)+5))

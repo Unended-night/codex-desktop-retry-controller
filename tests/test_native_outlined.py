@@ -2,6 +2,8 @@
 import json
 from pathlib import Path
 import struct
+import random
+import re
 import sys
 from types import SimpleNamespace
 import unittest
@@ -10,7 +12,7 @@ from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'research/.deps'))
 import capstone
-from controller.native import _file_address_map, _mapped_va
+from controller.native import _file_address_map, _mapped_va, _relative_reference_candidates
 from controller.native_v4 import (classifier, duration_branch, http_budget, locate_outlined, outer,
                                   protocol_slice, replacements, responses_transport, safe_ranges)
 from controller import native
@@ -49,6 +51,30 @@ class AnalysisCacheTests(unittest.TestCase):
 
 
 class FileAddressTests(unittest.TestCase):
+    def test_relative_reference_prefilter_matches_full_scan_across_blocks_and_sections(self):
+        base=0x140000000
+        data=bytearray(random.Random(42).randbytes(0x34000))
+        regions=[(0,0x18000,base),(0x1c000,len(data),base+0x90000)]
+        def address(at):
+            return next(va+at-start for start,end,va in regions if start<=at<end)
+        targets=[base-0x10000,base+0x10100,base+0x90030,base+0x80000000]
+        for target in targets:
+            for at,opcode in [(0x20,b'\xe8'),(0xfffe,b'\xe9'),(0x10013,b'\x48\x8d\x05'),
+                              (0x1c008,b'\xe8'),(0x2bffd,b'\x4c\x8d\x1d')]:
+                displacement=target-address(at)-len(opcode)-4
+                if -0x80000000<=displacement<=0x7fffffff:
+                    data[at:at+len(opcode)+4]=opcode+struct.pack('<i',displacement)
+            def reaches(at,size):
+                try:
+                    return address(at)+size+struct.unpack_from('<i',data,at+size-4)[0]==target
+                except (StopIteration,struct.error):
+                    return False
+            expected={(m.start(),5 if len(m[0])==1 else 7) for m in
+                      re.finditer(rb'[\xe8\xe9]|[\x48-\x4f]\x8d[\x05\x0d\x15\x1d\x25\x2d\x35\x3d]',data)
+                      if reaches(m.start(),5 if len(m[0])==1 else 7)}
+            actual={(at,size) for at,size in _relative_reference_candidates(data,regions,target) if reaches(at,size)}
+            self.assertEqual(actual,expected)
+
     def image(self, sections):
         return SimpleNamespace(
             OPTIONAL_HEADER=SimpleNamespace(ImageBase=0x140000000,SizeOfHeaders=0x200),
@@ -484,7 +510,7 @@ class OutlinedTests(unittest.TestCase):
             self.http_layout(variant)
 
     def outlined_image(self, gates=1, unknown_caller=False, missing_endpoint=False,
-                       changed_enum=False, duplicate_outer=False, signed_enum=False, reloaded_last=False):
+                       changed_enum=False, duplicate_outer=False, signed_enum=False, reloaded_last=False, optimized=False):
         """Sparse real outer fragment plus synthetic protocol-scoped gates.
 
         No log, instrumentation or function-name strings exist in this image.
@@ -553,7 +579,16 @@ class OutlinedTests(unittest.TestCase):
             return any(o.type==3 and i.reg_name(o.mem.base)=='rip' and
                        data[i.address+i.size+o.mem.disp-base:][:len(needle)]==needle
                        for i in ins for o in i.operands)
-        return locate_outlined(data,function,lambda va:va-base,lambda at:base+at,refs,None)
+        options = dict(reference_candidates=lambda target: _relative_reference_candidates(data,[(0,len(data),base)],target),
+                       has_reference=lambda at,needle: refs(function(at)[1],needle)) if optimized else {}
+        return locate_outlined(data,function,lambda va:va-base,lambda at:base+at,refs,None,**options)
+
+    def test_optimized_locator_preserves_sites_and_unproven_caller_rejection(self):
+        self.assertEqual(self.outlined_image(gates=2,reloaded_last=True),
+                         self.outlined_image(gates=2,reloaded_last=True,optimized=True))
+        for options in (dict(unknown_caller=True),dict(missing_endpoint=True)):
+            with self.subTest(options=options),self.assertRaises(ValueError):
+                self.outlined_image(gates=2,optimized=True,**options)
 
     def test_locator_needs_no_log_or_function_names(self):
         for changed_enum in (False,True):

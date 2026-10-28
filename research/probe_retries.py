@@ -6,12 +6,21 @@ Does not modify installed programs or real user configuration.
 import argparse
 import json
 import os
+import re
+from decimal import Decimal
 from pathlib import Path
 import subprocess
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def retry_delays(stderr):
+    """Native Duration logs reveal the selected wait, separate from scheduling."""
+    factors = {'s': Decimal(1000), 'ms': Decimal(1), 'µs': Decimal('.001'), 'ns': Decimal('.000001')}
+    return [int(Decimal(value)*factors[unit]) for value,unit in
+            re.findall(r'retrying sampling request \(\d+/\d+ in ([0-9.]+)(ms|µs|ns|s)\)', stderr)]
 
 
 def probe(exe, retries, *, stream_retries=0, mode="http", debug_patches=None, retry_after=None, stop_after=7, error_status=500, succeed=False, timeout=45, error_code=None, interface="exec"):
@@ -56,6 +65,7 @@ def probe(exe, retries, *, stream_retries=0, mode="http", debug_patches=None, re
             root = Path(directory)
             (root / "config.toml").write_text(
                 'model = "retry-probe-model"\nmodel_provider = "probe"\n'
+                '[features]\nplugins = false\n'
                 '[model_providers.probe]\nname = "loopback probe"\n'
                 f'base_url = "http://127.0.0.1:{server.server_port}/v1"\n'
                 'env_key = "CODEX_LOCAL_PROBE_KEY"\nwire_api = "responses"\n'
@@ -98,6 +108,7 @@ def probe(exe, retries, *, stream_retries=0, mode="http", debug_patches=None, re
                     "paths": sorted(set(e["path"] for e in events)),
                     "interface": interface, "exit_code": exit_code, "timed_out": timed_out,
                     "duration_seconds": round(time.monotonic() - start, 3),
+                    "selected_delays_ms": retry_delays(stderr),
                     "stdout_tail": stdout[-2000:], "stderr_tail": stderr[-2000:]}
     finally:
         server.shutdown()

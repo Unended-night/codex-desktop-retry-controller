@@ -3,14 +3,16 @@ import contextlib
 from pathlib import Path
 import sys
 import tempfile
-from .core import Manager, ROOT, profile, sha, unb64, exclusive_binary, ControllerError
+from .core import Manager, ROOT, SUPPORTED_SHA256, profile, sha, unb64, exclusive_binary, ControllerError
 
 REQUIRED_CASES = ('zero-budget','http-fixed','http-429','quota-terminal','http-529',
                   'http-retry-after','stream-interrupted','stream-server-delay',
                   'connection-failure','success-after-failures','app-server-success',
                   'app-server-budget','whole-seconds','thousand-retries',
                   'http-400-classification','http-401-classification',
-                  'http-403-classification','http-404-classification')
+                  'http-403-classification','http-404-classification',
+                  'millisecond-fixed')
+JITTER_CASES = ('jitter-http','jitter-cross-second','jitter-millisecond')
 
 
 def run_suite(data, owner):
@@ -18,7 +20,10 @@ def run_suite(data, owner):
     from probe_retries import probe
     work = owner.state / '.verification'
     work.mkdir(parents=True,exist_ok=True)
-    report={'cases':[]}
+    from .native import locate
+    jitter_supported = (sha(data) != SUPPORTED_SHA256 and
+                        locate(data, ControllerError)['family'] == 'responses-sampling-x64-outlined')
+    report={'cases':[], 'supports_jitter':jitter_supported}
     with tempfile.TemporaryDirectory(dir=work,prefix='native-') as directory, contextlib.ExitStack() as cleanup:
         path=Path(directory)/'codex.exe'
         path.write_bytes(data)
@@ -60,6 +65,22 @@ def run_suite(data, owner):
         for status,retryable in original_classification.items():
             case(f'http-{status}-classification',2,'0.125',3 if retryable else 1,error_status=status)
             report['cases'][-1]['original_retryable']=retryable
+        case('millisecond-fixed',3,'0.001',4)
+        jitter_cases = [('jitter-http',100,70,'exec'), ('jitter-cross-second',1000,70,'app-server'),
+                        ('jitter-millisecond',5,4,'exec')] if jitter_supported else []
+        for name,base,spread,interface in jitter_cases:
+            manager.apply(path,profile(8,base,spread,unit='ms'))
+            result=probe(str(path),4,stream_retries=5,stop_after=10,interface=interface)
+            delays=result['selected_delays_ms']
+            assert not result['timed_out'] and result['exit_code']==1 and result['requests']==9, name
+            assert len(delays)==8 and all(base-spread<=v<=base+spread for v in delays), f'{name}: chosen wait outside range'
+            assert len(set(delays))>1, f'{name}: no observed variation'
+            assert all(max(0,wait/1000-.04)<=actual<=wait/1000+.5
+                       for wait,actual in zip(delays,result['intervals_seconds'])), f'{name}: interval mismatch'
+            report['cases'].append(dict(name=name,passed=True,profile=profile(8,base,spread,unit='ms'),
+                                       requests=result['requests'],selected_delays_ms=delays,
+                                       intervals_seconds=result['intervals_seconds'],interface=interface))
+            owner.logger.info('Native case passed: %s requests=%s',name,result['requests'])
         manager.restore(path)
         assert sha(path.read_bytes())==sha(data),'restore mismatch'
         assert not manager.restore(path)['changed'],'restore is not idempotent'

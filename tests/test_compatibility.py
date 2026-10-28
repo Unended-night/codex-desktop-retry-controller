@@ -6,10 +6,37 @@ from pathlib import Path
 from unittest.mock import patch
 from controller.core import Manager, ControllerError, atomic_json, b64, sha, version_of
 from controller.verification import cached, cache_path
-from controller.native_suite import REQUIRED_CASES
+from controller.native_suite import REQUIRED_CASES, JITTER_CASES
 
 
 class Compatibility(unittest.TestCase):
+    def test_approved_status_and_verify_skip_disassembly_but_recheck_bytes_and_recipe(self):
+        with tempfile.TemporaryDirectory() as d, contextlib.ExitStack() as cleanup:
+            manager=Manager(Path(d)/'tool')
+            cleanup.callback(manager.close)
+            exe=Path(d)/'engine.exe'
+            data=b'MZ codex-app-server99.12.3 original'
+            exe.write_bytes(data)
+            record=dict(format=1,passed=True,recipe_sha256='recipe',base_sha256=sha(data),
+                        restored_sha256=sha(data),interrupted_write_recovery=True,unrelated_change_refused=True,
+                        undo_bytes=42,cases=[dict(name=n,passed=True) for n in REQUIRED_CASES])
+            atomic_json(cache_path(manager,data),record)
+            with patch('controller.verification.recipe_id',return_value='recipe'), \
+                 patch('controller.core.build_plan',side_effect=AssertionError('unexpected analysis')):
+                status=manager.inspect(exe)
+                self.assertTrue(status['verified'] and status['compatible'])
+                self.assertEqual(status['undo_bytes'],42)
+                self.assertEqual(manager.verify(exe),record)
+            with patch('controller.verification.recipe_id',return_value='changed'), \
+                 patch('controller.core.build_plan',return_value=[]) as analyze:
+                self.assertFalse(manager.inspect(exe)['verified'])
+                analyze.assert_called_once()
+            exe.write_bytes(data[:-1]+b'X')
+            with patch('controller.verification.recipe_id',return_value='recipe'), \
+                 patch('controller.core.build_plan',return_value=[]) as analyze:
+                self.assertFalse(manager.inspect(exe)['verified'])
+                analyze.assert_called_once()
+
     def test_version_read_is_independent_of_support(self):
         self.assertEqual(version_of(b'MZ codex-app-server99.12.3failed to start'),'99.12.3')
 
@@ -89,6 +116,27 @@ class Compatibility(unittest.TestCase):
                 record['cases'].pop()
                 atomic_json(cache_path(m,data),record)
                 self.assertIsNone(cached(m,data))
+
+    def test_jitter_approval_requires_all_jitter_cases(self):
+        with tempfile.TemporaryDirectory() as d:
+            manager=Manager(Path(d))
+            try:
+                data=b'fixture'
+                record=dict(format=1,passed=True,supports_jitter=True,recipe_sha256='recipe',
+                            base_sha256=sha(data),restored_sha256=sha(data),
+                            interrupted_write_recovery=True,unrelated_change_refused=True,
+                            cases=[dict(name=n,passed=True) for n in REQUIRED_CASES])
+                with patch('controller.verification.recipe_id',return_value='recipe'):
+                    atomic_json(cache_path(manager,data),record)
+                    self.assertIsNone(cached(manager,data))
+                    record['cases'] += [dict(name=n,passed=True) for n in JITTER_CASES]
+                    atomic_json(cache_path(manager,data),record)
+                    self.assertIsNotNone(cached(manager,data))
+                    record['cases'][-1]['passed']=False
+                    atomic_json(cache_path(manager,data),record)
+                    self.assertIsNone(cached(manager,data))
+            finally:
+                manager.close()
 
 
 if __name__=='__main__':

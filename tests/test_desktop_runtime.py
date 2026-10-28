@@ -18,7 +18,8 @@ def retry_result(p):
     return dict(timed_out=False, exact_error_seen=True, requests=attempts + 1,
                 turn_exit_code=1 if p['max_retries'] <= 2 else 0,
                 reconnects=[f"Reconnecting... {i}/{p['max_retries']}" for i in range(1, attempts + 1)],
-                intervals_seconds=[p['interval_ms'] / 1000 + .03] * attempts)
+                intervals_seconds=[p['interval_ms'] / 1000 + .03] * attempts,
+                selected_delays_ms=[p['interval_ms']] * attempts)
 
 
 def matrices():
@@ -94,6 +95,13 @@ class RuntimeTests(unittest.TestCase):
         for p in (profile(0, '0'), profile(1, '60'), profile(1000000, '.001')):
             self.publish(p)
             self.assertEqual(self.selected()['profile'], p)
+
+    def test_jitter_profile_survives_publication_selection_and_saved_settings(self):
+        p=profile(50,1000,70,unit='ms')
+        self.publish(p)
+        self.assertEqual(self.selected()['profile'],p)
+        self.assertEqual(runtime.saved_profile(self.root),p)
+        self.assertIn('±70 毫秒',self.selected()['reason'])
 
     def test_failed_validation_keeps_pointer(self):
         self.validator.side_effect = ControllerError('fixture failure')
@@ -323,6 +331,20 @@ class RuntimeTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_jitter_receipt_checks_chosen_waits_and_measured_intervals(self):
+        p=profile(2,1000,70,unit='ms')
+        result=dict(retry_result(p),selected_delays_ms=[930,1070],intervals_seconds=[.94,1.08])
+        self.assertTrue(validation.check_retry(result,p))
+        for changes in (dict(selected_delays_ms=[929,1070]),dict(selected_delays_ms=[930,1071]),
+                        dict(selected_delays_ms=[]),dict(selected_delays_ms=[930,True]),
+                        dict(intervals_seconds=[.1,.1])):
+            self.assertFalse(validation.check_retry(dict(result,**changes),p))
+
+    def test_native_duration_log_units_preserve_millisecond_values(self):
+        from research.probe_retries import retry_delays
+        stderr='\n'.join(f'retrying sampling request (1/2 in {value})' for value in ('930ms','1.07s','1ms','0ns'))
+        self.assertEqual(retry_delays(stderr),[930,1070,1,0])
+
     def test_config_notes_never_expose_provider_values_or_parser_errors(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'config.toml'

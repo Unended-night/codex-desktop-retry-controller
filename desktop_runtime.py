@@ -14,7 +14,7 @@ import threading
 import time
 import traceback
 
-from controller.core import ROOT, ControllerError, Manager, atomic_json, now, profile, validate_profile
+from controller.core import ROOT, ControllerError, Manager, atomic_json, now, profile, profile_label, validate_profile
 from controller.verification import cache_path, recipe_id
 import desktop_trial as launcher
 import desktop_validation as validation
@@ -250,7 +250,7 @@ def running_state(root, processes, selected):
             p = validate_profile(manifest['profile'])
             if launcher.digest(exe) != manifest['runtime_files']['codex.exe']:
                 raise ValueError('hash')
-            labels.append(f"{p['max_retries']} 次 / {p['interval_ms']/1000:g} 秒")
+            labels.append(profile_label(p))
             matches.append(selected['mode'] == 'custom-trial' and exe == Path(selected['engine']).resolve())
         except (OSError, ValueError, KeyError, TypeError, ControllerError):
             # A path outside managed runtime is only called official after hashing it.
@@ -296,10 +296,10 @@ class DesktopManager:
         p = saved_profile(self.root)
         custom = selected['mode'] == 'custom-trial'
         enabled = read_pointer(self.root).get('enabled', True) is not False
-        next_text = (f"下次启动：{selected['profile']['max_retries']} 次 / {selected['profile']['interval_ms']/1000:g} 秒"
+        next_text = (f"下次启动：{profile_label(selected['profile'])}"
                      if custom else '下次启动：官方默认')
         if not custom and enabled and read_pointer(self.root).get('runtime'):
-            next_text = f"下次启动：自动适配 {p['max_retries']} 次 / {p['interval_ms']/1000:g} 秒（验收失败则使用官方）"
+            next_text = f"下次启动：自动适配 {profile_label(p)}（验收失败则使用官方）"
         if pending:
             next_text += '（待正常退出后从自定义入口启动）'
         reason = (native.get('reason') if not native['compatible'] else '') or selected['reason']
@@ -324,7 +324,8 @@ class DesktopManager:
                    action, '--worker', '--root', str(self.root), '--config', str(self.config), '--result', str(output)]
         if p is not None:
             p = validate_profile(p)
-            command += ['--retries', str(p['max_retries']), '--interval', f"{p['interval_ms']/1000:.3f}"]
+            command += ['--retries', str(p['max_retries']), '--interval-ms', str(p['interval_ms']),
+                        '--jitter-ms', str(p.get('jitter_ms', 0))]
         command += list(extra)
         # Pipe native probe output to a file; pythonw has no reliable stdout.
         with output.with_suffix('.log').open('w', encoding='utf-8') as log:
@@ -384,13 +385,21 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='cleanup 仅列出清理计划')
     parser.add_argument('--keep-history', action='store_true', help='cleanup 按自动策略保留一个历史版本；默认清空可删除历史')
     parser.add_argument('--retries')
-    parser.add_argument('--interval')
+    units = parser.add_mutually_exclusive_group()
+    units.add_argument('--interval', help='基础等待秒数，支持三位小数')
+    units.add_argument('--interval-ms', help='基础等待毫秒数')
+    parser.add_argument('--jitter-ms', default='0', help='对称随机扰动毫秒数，0 表示固定等待')
     parser.add_argument('--root', type=Path, default=ROOT)
     parser.add_argument('--config', type=Path, default=config_path())
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--result', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--job-gate', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    def requested_profile():
+        if args.interval_ms is not None:
+            return profile(args.retries, args.interval_ms, args.jitter_ms, unit='ms')
+        base = profile(args.retries, args.interval)
+        return profile(args.retries, base['interval_ms'], args.jitter_ms, unit='ms')
     from desktop_processes import wait_worker_gate
     wait_worker_gate(args.job_gate)
     manager = DesktopManager(args.root, config=args.config)
@@ -408,7 +417,7 @@ def main():
                     elif args.action == 'auto':
                         result = auto_prepare(args.root, args.config)
                     else:
-                        p = profile(args.retries, args.interval) if args.action == 'apply' else saved_profile(args.root)
+                        p = requested_profile() if args.action == 'apply' else saved_profile(args.root)
                         result = prepare(args.root, p, args.config, force=args.action == 'verify')
                     result['action'] = args.action
                     if args.action != 'cleanup':
@@ -417,7 +426,7 @@ def main():
         elif args.action == 'status':
             result = manager.inspect()
         elif args.action == 'apply':
-            result = manager.apply(profile(args.retries, args.interval))
+            result = manager.apply(requested_profile())
         elif args.action == 'auto':
             result = manager._worker('auto')
         elif args.action == 'cleanup':

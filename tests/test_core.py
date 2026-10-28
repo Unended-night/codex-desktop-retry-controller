@@ -5,10 +5,28 @@ from pathlib import Path
 from unittest.mock import patch
 
 from controller.core import ControllerError, b64, profile, recover_baseline, sha
-from controller.core import exclusive_binary, version_of
+from controller.core import exclusive_binary, version_of, validate_profile, profile_label
 
 
 class Inputs(unittest.TestCase):
+    def test_millisecond_units_jitter_and_legacy_profile_roundtrip(self):
+        expected = dict(max_retries=50,interval_ms=1000,jitter_ms=70)
+        self.assertEqual(profile(50,1000,70,unit='ms'),expected)
+        self.assertEqual(profile(50,'1','.07'),expected)
+        self.assertEqual(validate_profile(expected),expected)
+        self.assertEqual(validate_profile(dict(expected,jitter_ms=0)),profile(50,'1'))
+        self.assertEqual(profile(2,30000,30000,unit='ms')['jitter_ms'],30000)
+        self.assertIn('±70 毫秒',profile_label(expected))
+
+    def test_invalid_jitter_and_submillisecond_values_are_rejected(self):
+        for base,spread,unit in [(1000,1001,'ms'),(59999,2,'ms'),(1,-1,'ms'),
+                                 (1,'NaN','ms'),(1,'.1','ms'),('.0001',0,'s'),(1,0,'minutes')]:
+            with self.subTest(base=base,spread=spread,unit=unit),self.assertRaises(ControllerError):
+                profile(2,base,spread,unit=unit)
+        for spread in (True,1.5,'70'):
+            with self.subTest(spread=spread),self.assertRaises(ControllerError):
+                validate_profile(dict(max_retries=2,interval_ms=1000,jitter_ms=spread))
+
     def test_zero_and_fractional_seconds(self):
         self.assertEqual(profile("0", "0"), {"max_retries": 0, "interval_ms": 0})
         self.assertEqual(profile("1000", "0.5"), {"max_retries": 1000, "interval_ms": 500})

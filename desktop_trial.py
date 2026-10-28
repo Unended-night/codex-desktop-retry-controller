@@ -73,7 +73,7 @@ def selection(resources, runtime, manifest, config_path, expected_recipe):
         validation=json.loads((runtime/'validation.json').read_text(encoding='utf-8'))
         if not validation.get('trial_eligible'):
             return reject('验证报告没有批准试用。')
-        from controller.core import validate_profile
+        from controller.core import validate_profile, profile_label
         p = validate_profile(manifest['profile'])
         if manifest.get('format', 1) in (2, 3):
             from desktop_validation import rules_id, receipt_valid
@@ -86,7 +86,7 @@ def selection(resources, runtime, manifest, config_path, expected_recipe):
         from desktop_validation import configuration_notes
         return dict(mode='custom-trial',engine=str(runtime/'codex.exe'),desktop=fallback['desktop'],
                     config_notes=configuration_notes(config_path),
-                    profile=p, reason=f"{p['max_retries']} 次 / {p['interval_ms']/1000:g} 秒；app-server 与 unelevated 沙盒对照已通过；"+desktop_status+'。')
+                    profile=p, reason=profile_label(p)+'；app-server 与 unelevated 沙盒对照已通过；'+desktop_status+'。')
     except (OSError,ValueError,KeyError,TypeError,AttributeError,ControllerError):
         return reject('副本文件或记录不可用。')
 

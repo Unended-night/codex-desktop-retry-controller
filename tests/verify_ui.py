@@ -30,7 +30,15 @@ def main():
         app.show_status(status)
         assert '99.12.3' in app.current.get()
         assert str(app.apply_button['state'])=='normal'
-        assert app.max_retries.get()=='25' and app.interval.get()=='1'
+        assert app.max_retries.get()=='25' and app.interval.get()=='1000'
+        app.jitter.set('70')
+        assert '930～1070 毫秒' in app.wait_preview.get()
+        app.unit.set('秒'); app._unit_changed()
+        assert app.interval.get()=='1' and app.jitter.get()=='0.07'
+        app.unit.set('毫秒'); app._unit_changed()
+        assert app.interval.get()=='1000' and app.jitter.get()=='70'
+        app.show_status(dict(status,profile=dict(max_retries=25,interval_ms=1000,jitter_ms=50)))
+        assert app.jitter.get()=='50' and '950～1050 毫秒' in app.wait_preview.get()
         assert '2 次 / 0.25 秒' in app.next_start.get()
         app.show_status(dict(status, reason='范围提示（不拦截启动）：当前 Windows 沙盒组合尚未验证'))
         assert str(app.apply_button['state'])=='normal'
@@ -70,7 +78,7 @@ def main():
         app.update_idletasks()
         report=dict(passed=True,actual_version_display=True,incompatible_apply_disabled=True,
                     restore_always_enabled=True,current_and_next_separate=True,
-                    saved_values_loaded=True,manual_history_clear_display=True,
+                    saved_values_loaded=True,millisecond_units_and_jitter_preview=True,manual_history_clear_display=True,
                     process_recovery_available_while_busy=True,
                     window_size=[app.winfo_width(),app.winfo_height()])
         (ROOT/'logs/ui-verification.json').write_text(json.dumps(report,indent=2),encoding='utf-8')

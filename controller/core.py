@@ -62,6 +62,8 @@ def build_plan(data: bytes, p: dict) -> list[dict]:
             result.append(dict(offset=off,before=b64(data[off:off+size]),
                                after=b64(new.ljust(size,b'\x90')),label=label))
         return sorted(result,key=lambda x:x['offset'])
+    if p.get('jitter_ms', 0):
+        raise ControllerError('此旧版重试结构尚未支持随机扰动，可使用固定等待。')
     seconds, ms = divmod(p["interval_ms"], 1000)
     duration = b"\xb8" + struct.pack("<I", seconds) + b"\xba" + struct.pack("<I", ms * 1000000)
     replacements = {
@@ -100,29 +102,42 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def profile(retries: int | str, interval_seconds: str) -> dict:
+def profile(retries: int | str, interval_seconds: str, jitter: str = '0', *, unit: str = 's') -> dict:
     try:
         if not re.fullmatch(r"[0-9]+", str(retries).strip()):
             raise ValueError
         count = int(retries)
-        seconds = Decimal(str(interval_seconds).strip())
-        if not seconds.is_finite() or seconds < 0:
+        if unit not in ('s', 'ms'):
             raise ValueError
-        ms = seconds * 1000
-        if ms != ms.to_integral_value():
+        values = []
+        for text in (interval_seconds, jitter):
+            value = Decimal(str(text).strip()) * (1000 if unit == 's' else 1)
+            if not value.is_finite() or value < 0 or value != value.to_integral_value():
+                raise ValueError
+            values.append(int(value))
+        ms, spread = values
+        if not 0 <= count <= MAX_RETRIES or not 0 <= ms-spread <= ms+spread <= MAX_INTERVAL_MS:
             raise ValueError
-        ms = int(ms)
-        if not 0 <= count <= MAX_RETRIES or not 0 <= ms <= MAX_INTERVAL_MS:
-            raise ValueError
-        return {"max_retries": count, "interval_ms": ms}
+        result = {"max_retries": count, "interval_ms": ms}
+        if spread:
+            result['jitter_ms'] = spread
+        return result
     except (ValueError, InvalidOperation, OverflowError):
-        raise ControllerError("次数须为 0～1000000 的整数；间隔须为 0～60 秒，最多三位小数。") from None
+        raise ControllerError("次数须为 0～1000000 的整数；时间精度为 1 毫秒，基础等待 ± 扰动须在 0～60000 毫秒内。") from None
 
 
 def validate_profile(p: dict) -> dict:
-    if not isinstance(p, dict) or type(p.get("interval_ms")) is not int:
+    if (not isinstance(p, dict) or type(p.get("interval_ms")) is not int
+            or type(p.get('jitter_ms', 0)) is not int):
         raise ControllerError("无效的重试设置。")
-    return profile(p.get("max_retries"), str(Decimal(p["interval_ms"]) / 1000))
+    return profile(p.get("max_retries"), p['interval_ms'], p.get('jitter_ms', 0), unit='ms')
+
+
+def profile_label(p: dict) -> str:
+    text = f"{p['max_retries']} 次 / {p['interval_ms']/1000:g} 秒"
+    if p.get('jitter_ms', 0):
+        text += f"（随机扰动 ±{p['jitter_ms']} 毫秒）"
+    return text
 
 
 def patched_bytes(original: bytes, slots: list[dict]) -> bytes:
@@ -309,13 +324,18 @@ class Manager:
             if modified:
                 result["status"] = "custom" if sha(data) == journal["patched_sha256"] else "interrupted"
                 result["profile"] = journal["profile"]
-            plan = build_plan(baseline, {"max_retries": 1000, "interval_ms": 500})
+            from .verification import cached
+            approval = cached(self, baseline)
+            # A complete approval already proves this exact build and recipe.
+            # Status does not need to rediscover the same instructions.
+            plan = [] if approval else build_plan(baseline, {"max_retries": 1000, "interval_ms": 500})
             result["compatible"] = True
             if not modified:
                 result["status"] = "default"
             result["undo_bytes"] = sum(len(unb64(item["before"])) for item in (journal["slots"] if modified else plan))
-            from .verification import cached
-            result["verified"] = cached(self, baseline) is not None
+            if approval and not modified:
+                result["undo_bytes"] = approval.get('undo_bytes', 0)
+            result["verified"] = approval is not None
             if not result["verified"]:
                 result["reason"] = "结构已识别；首次应用前将自动验证，也可先点击验证兼容性。"
         except ControllerError as exc:
@@ -327,7 +347,6 @@ class Manager:
         from .verification import verify
         data = path.read_bytes()
         baseline, _ = self.baseline(path, data)
-        build_plan(baseline, {"max_retries": 1000, "interval_ms": 500})
         report = verify(self, baseline)
         if path.read_bytes() != data:
             raise ControllerError("验证期间安装程序发生变化，请重新检测。")
@@ -353,8 +372,11 @@ class Manager:
                 actual_version = version_of(baseline)
                 if p is not None and self.verify_writes:
                     from .verification import cached
-                    if cached(self, baseline) is None:
+                    approval = cached(self, baseline)
+                    if approval is None:
                         raise ControllerError("当前文件尚未通过行为验证，或验证后已更新。请重新验证。")
+                    if p.get('jitter_ms', 0) and approval.get('supports_jitter') is not True:
+                        raise ControllerError('当前构建尚未通过随机扰动验收，可使用固定等待。')
                 if p is None:
                     if old_journal is None:
                         build_plan(baseline, {"max_retries": 1000, "interval_ms": 500})

@@ -168,6 +168,7 @@ def sandbox_matrix(exe, parent, label, registered=False):
     (home / 'config.toml').write_text(
         'model="retry-probe-model"\nmodel_provider="probe"\n'
         'sandbox_mode="workspace-write"\napproval_policy="never"\nweb_search="disabled"\n'
+        '[features]\nplugins=false\n'
         '[windows]\nsandbox="unelevated"\n'
         '[model_providers.probe]\nname="offline test"\nbase_url="http://127.0.0.1:9/v1"\n'
         'env_key="CODEX_LOCAL_PROBE_KEY"\nwire_api="responses"\n', encoding='utf-8')

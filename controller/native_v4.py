@@ -553,8 +553,9 @@ class ResponsesCallGraph:
     MAX_WRAPPERS = 4
     MAX_FUNCTIONS = 64
 
-    def __init__(self, data, function, off, va, refs):
+    def __init__(self, data, function, off, va, refs, reference_candidates=None):
         self.data, self.function, self.off, self.va = data, function, off, va
+        self.reference_candidates = reference_candidates
         self.incoming = {}
         self.models = {}
 
@@ -574,9 +575,9 @@ class ResponsesCallGraph:
         # Include address-taking LEAs and tail jumps so they cannot silently
         # disappear from the call graph. File offsets need not share a section.
         pattern=rb'[\xe8\xe9]|[\x48-\x4f]\x8d[\x05\x0d\x15\x1d\x25\x2d\x35\x3d]'
-        for match in re.finditer(pattern,data):
-            at=match.start()
-            size=5 if len(match[0])==1 else 7
+        candidates = (self.reference_candidates(target) if self.reference_candidates else
+                      ((m.start(), 5 if len(m[0]) == 1 else 7) for m in re.finditer(pattern,data)))
+        for at, size in candidates:
             if at+size>len(data):
                 continue
             try:
@@ -640,7 +641,7 @@ def responses_transport(data, entry, function, off, va, refs):
     return ResponsesCallGraph(data, function, off, va, refs).prove(entry)
 
 
-def locate_outlined(data, function, off, va, refs, cs):
+def locate_outlined(data, function, off, va, refs, cs, *, has_reference=None, reference_candidates=None):
     candidates=[]
     # A cheap scan narrows decoding to calls returning an Option<Duration>.
     pattern=(rb'\xe8....(?:\x90|\x66\x90|\x0f\x1f\x00|\x0f\x1f\x40.){0,4}'
@@ -658,13 +659,15 @@ def locate_outlined(data, function, off, va, refs, cs):
             continue
     result=only(candidates,'sampling policy')
     http={}
-    graph=ResponsesCallGraph(data,function,off,va,refs)
+    graph=ResponsesCallGraph(data,function,off,va,refs,reference_candidates)
     # SUB r64, imm8/imm32; MOV r32, imm32; CMOVAE/CMOVGE r64, r64. The
     # constants are enum inputs, not identities of a particular release.
     pattern=(rb'[\x48-\x4f](?:\x83[\xe8-\xef].|\x81[\xe8-\xef]....|\x2d....)'
              rb'[\x40-\x41]?[\xb8-\xbf]....[\x48-\x4f]\x0f[\x43\x4d][\xc0-\xff]')
     for match in re.finditer(pattern,data,re.S):
         try:
+            if has_reference is not None and not has_reference(match.start(), b'text/event-stream'):
+                continue
             bounds,ins=function(match.start())
             if not refs(ins,b'text/event-stream'):
                 continue
@@ -693,6 +696,25 @@ def jmp(source,target,opcode=b'\xe9'):
     return opcode+struct.pack('<i',target-source-len(opcode)-4)
 
 
+def delay_code(p):
+    """Return Duration in RAX/EDX, using only caller-clobbered registers.
+
+    TSC timing mixed into a 32-bit value supplies non-cryptographic jitter.
+    No state, stack, external call or shared helper is changed. Milliseconds
+    are chosen inclusively then split, so jitter can safely cross a second.
+    """
+    spread = p.get('jitter_ms', 0)
+    if not spread:
+        return b'\xb8'+struct.pack('<I',p['interval_ms']//1000)+b'\xba'+struct.pack('<I',p['interval_ms']%1000*1_000_000)
+    code = bytes.fromhex('0f3131d0')  # RDTSC; XOR EAX, EDX.
+    code += b'\x69\xc0'+struct.pack('<I',0x45d9f3b)
+    code += bytes.fromhex('89c2c1ea1031d031d241b9')+struct.pack('<I',2*spread+1)
+    code += bytes.fromhex('41f7f18d82')+struct.pack('<I',p['interval_ms']-spread)
+    code += bytes.fromhex('31d241b9')
+    code += struct.pack('<I',1000)+bytes.fromhex('41f7f169d2')+struct.pack('<I',1_000_000)
+    return code
+
+
 def replacements(s,p):
     cave=s['connection']
     code=s.get('bounded_reload',b'')
@@ -700,7 +722,7 @@ def replacements(s,p):
     classifier_entry=cave+len(code)
     code+=s['prefix']
     code+=jmp(cave+len(code),s['continuation'],b'\x0f\x82')  # native terminal bit: return None
-    code+=b'\xb8'+struct.pack('<I',p['interval_ms']//1000)+b'\xba'+struct.pack('<I',p['interval_ms']%1000*1_000_000)
+    code+=delay_code(p)
     code+=jmp(cave+len(code),s['continuation'])
     offsets=s['offsets']
     patches=[(offsets['call'],5,jmp(s['call'],classifier_entry),'model_outer_policy'),

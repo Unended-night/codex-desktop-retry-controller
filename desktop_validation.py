@@ -52,12 +52,21 @@ def check_retry(result, p):
     # Small budgets are exhausted; larger budgets are sampled then succeed.
     expected_exit = 1 if limit <= 2 else 0
     delay = p['interval_ms'] / 1000
+    spread = p.get('jitter_ms', 0)
+    waits = [delay] * attempts
+    if spread:
+        selected = result.get('selected_delays_ms', [])
+        if (len(selected) != attempts or any(type(v) is not int or
+                not p['interval_ms']-spread <= v <= p['interval_ms']+spread for v in selected)):
+            return False
+        waits = [v/1000 for v in selected]
     return (result.get('timed_out') is False and result.get('exact_error_seen') is True
             and result.get('requests') == attempts + 1
             and result.get('turn_exit_code') == expected_exit
             and result.get('reconnects') == [f'Reconnecting... {i}/{limit}' for i in range(1, attempts + 1)]
             and len(result.get('intervals_seconds', [])) == attempts
-            and all(max(0, delay - .06) <= v <= delay + 1.5 for v in result['intervals_seconds']))
+            and all(max(0, wait - .06) <= v <= wait + 1.5
+                    for v,wait in zip(result['intervals_seconds'], waits)))
 
 
 def sandbox_valid(matrices):
@@ -115,7 +124,7 @@ def run(resources, target, manifest):
     p = manifest['profile']
     retry = replay(target / 'codex.exe', work / 'retry',
                    stop_after=2 if p['max_retries'] > 2 else None,
-                   timeout=45 + 2 * p['interval_ms'] / 1000)
+                   timeout=45 + 2 * (p['interval_ms']+p.get('jitter_ms', 0)) / 1000)
     if not check_retry(retry, p):
         raise ControllerError(f'新参数的重试次数或实际等待时间未通过验收：{retry}')
     matrices = [sandbox_matrix(resources / 'codex.exe', work, 'official', registered=True),

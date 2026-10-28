@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 from decimal import Decimal
@@ -30,7 +31,11 @@ class App(tk.Tk):
         self.version = "未识别"
         self.jobs = queue.Queue()
         self.max_retries = tk.StringVar(value="25")
-        self.interval = tk.StringVar(value="1")
+        self.interval = tk.StringVar(value="1000")
+        self.jitter = tk.StringVar(value="0")
+        self.unit = tk.StringVar(value="毫秒")
+        self.previous_unit = "毫秒"
+        self.wait_preview = tk.StringVar()
         self.mode = tk.StringVar(value="custom")
         self.current = tk.StringVar(value="正在检测安装…")
         self.next_start = tk.StringVar(value="")
@@ -38,6 +43,9 @@ class App(tk.Tk):
         self.notice = tk.StringVar(value="打开时只检测。保存设置将验证新副本，通过后更新自定义启动入口。")
         self.widgets = []
         self._build()
+        self.interval.trace_add('write', self._time_changed)
+        self.jitter.trace_add('write', self._time_changed)
+        self._time_changed()
         self.after(100, self._poll)
         self.after(150, self.refresh)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -70,24 +78,35 @@ class App(tk.Tk):
         ttk.Label(body, textvariable=self.location, style="Muted.TLabel", wraplength=735).pack(anchor="w", pady=(8, 12))
         modes = ttk.Frame(body)
         modes.pack(fill="x", pady=(0, 16))
-        for title, value in [("自定义固定间隔", "custom"), ("官方默认", "default")]:
+        for title, value in [("自定义重试", "custom"), ("官方默认", "default")]:
             radio = ttk.Radiobutton(modes, text=title, variable=self.mode, value=value, command=self._mode_changed)
             radio.pack(side="left", padx=(0, 26))
             self.widgets.append(radio)
+        ttk.Label(modes, text="时间单位").pack(side="left", padx=(10, 8))
+        self.unit_box = ttk.Combobox(modes, textvariable=self.unit, values=('毫秒', '秒'), width=6, state='readonly')
+        self.unit_box.pack(side='left')
+        self.unit_box.bind('<<ComboboxSelected>>', self._unit_changed)
+        self.widgets.append(self.unit_box)
         fields = ttk.Frame(body)
         fields.pack(fill="x")
         fields.columnconfigure(0, weight=1)
         fields.columnconfigure(1, weight=1)
+        fields.columnconfigure(2, weight=1)
         ttk.Label(fields, text="最多重试次数").grid(row=0, column=0, sticky="w")
-        ttk.Label(fields, text="失败后的等待间隔（秒）").grid(row=0, column=1, sticky="w")
+        ttk.Label(fields, text="基础等待").grid(row=0, column=1, sticky="w")
+        ttk.Label(fields, text="随机扰动（±）").grid(row=0, column=2, sticky="w")
         self.count_entry = ttk.Entry(fields, textvariable=self.max_retries, width=20)
         self.delay_entry = ttk.Entry(fields, textvariable=self.interval, width=20)
+        self.jitter_entry = ttk.Entry(fields, textvariable=self.jitter, width=15)
         self.count_entry.grid(row=1, column=0, sticky="ew", padx=(0, 18), pady=6)
-        self.delay_entry.grid(row=1, column=1, sticky="ew", pady=6)
-        self.widgets.extend((self.count_entry, self.delay_entry))
+        self.delay_entry.grid(row=1, column=1, sticky="ew", padx=(0, 18), pady=6)
+        self.jitter_entry.grid(row=1, column=2, sticky="ew", pady=6)
+        self.widgets.extend((self.count_entry, self.delay_entry, self.jitter_entry))
         ttk.Label(fields, text="0～1,000,000；0 表示不重试", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
-        ttk.Label(fields, text="0～60 秒；0 表示不主动等待", style="Muted.TLabel").grid(row=2, column=1, sticky="w")
-        ttk.Label(body, text="次数不含首次请求；间隔不含请求耗时。可以保持 Codex 运行并保存设置。\n保存成功后，正常退出 Codex，再从自定义重试入口或上方按钮启动。",
+        ttk.Label(fields, text="精度 1 毫秒；最大 60 秒", style="Muted.TLabel").grid(row=2, column=1, sticky="w")
+        ttk.Label(fields, text="0 为固定等待", style="Muted.TLabel").grid(row=2, column=2, sticky="w")
+        ttk.Label(body, textvariable=self.wait_preview, wraplength=735).pack(anchor='w', pady=(12, 0))
+        ttk.Label(body, text="次数不含首次请求；等待从失败后开始，请求耗时另计。毫秒数是设定精度，实际受系统调度影响。\n保存成功后，正常退出 Codex，再从自定义重试入口或上方按钮启动。",
                   style="Muted.TLabel", wraplength=735).pack(anchor="w", pady=(16, 14))
         actions = ttk.Frame(body)
         actions.pack(fill="x")
@@ -136,7 +155,35 @@ class App(tk.Tk):
         state = "normal" if self.mode.get() == "custom" and not self.busy else "disabled"
         self.count_entry.configure(state=state)
         self.delay_entry.configure(state=state)
+        self.jitter_entry.configure(state=state)
+        self.unit_box.configure(state='readonly' if state == 'normal' else 'disabled')
         self._permissions()
+
+    def _time_changed(self, *_):
+        try:
+            p = profile(0, self.interval.get(), self.jitter.get(), unit='ms' if self.unit.get() == '毫秒' else 's')
+            base, spread = p['interval_ms'], p.get('jitter_ms', 0)
+            text = (f"每次失败后随机等待 {base-spread}～{base+spread} 毫秒" if spread else
+                    f"每次失败后固定等待 {base} 毫秒" if base else "失败后立即重试，不主动等待")
+            self.wait_preview.set(text)
+        except ControllerError:
+            self.wait_preview.set('请输入有效时间：基础等待 ± 扰动须在 0～60000 毫秒内。')
+
+    def _unit_changed(self, _=None):
+        if self.unit.get() == self.previous_unit:
+            return
+        try:
+            factor = Decimal(1000) if self.unit.get() == '毫秒' else Decimal('0.001')
+            values = [Decimal(v.get()) * factor for v in (self.interval, self.jitter)]
+            if not all(v.is_finite() for v in values):
+                raise ValueError
+        except (ValueError, ArithmeticError):
+            self.unit.set(self.previous_unit)
+            return
+        self.previous_unit = self.unit.get()
+        for variable, value in zip((self.interval, self.jitter), values):
+            variable.set(format(value.normalize(), 'f'))
+        self._time_changed()
 
     def _permissions(self):
         compatible = self.detected.get("compatible", False)
@@ -171,8 +218,11 @@ class App(tk.Tk):
 
         def worker():
             try:
+                started = time.perf_counter()
                 with self.manager.cancellable(cancel):
                     result = work()
+                if isinstance(result, dict):
+                    result['elapsed_seconds'] = round(time.perf_counter()-started, 2)
                 self.jobs.put((operation_id, done, result, None))
             except Exception as exc:
                 self.jobs.put((operation_id, done, None, str(exc)))
@@ -217,10 +267,13 @@ class App(tk.Tk):
         self.next_start.set(result['next_text'])
         p = result['profile']
         self.max_retries.set(str(p['max_retries']))
-        self.interval.set(str(Decimal(p['interval_ms']) / 1000))
+        divisor = 1 if self.unit.get() == '毫秒' else 1000
+        self.interval.set(format(Decimal(p['interval_ms']) / divisor, 'f'))
+        self.jitter.set(format(Decimal(p.get('jitter_ms', 0)) / divisor, 'f'))
         self.mode.set('custom' if result['enabled'] else 'default')
         self._mode_changed()
-        self._record(f"检测完成 · {self.current.get()}")
+        elapsed = f" · {result['elapsed_seconds']:g} 秒" if 'elapsed_seconds' in result else ''
+        self._record(f"检测完成{elapsed} · {self.current.get()}")
         self.notice.set(result.get("reason") or "可保存设置；将在下次从自定义入口启动时生效。")
 
     def refresh(self):
@@ -238,7 +291,8 @@ class App(tk.Tk):
             self.notice.set("请先检测 Codex 桌面安装。")
             return
         try:
-            p = profile(self.max_retries.get(), self.interval.get())
+            p = profile(self.max_retries.get(), self.interval.get(), self.jitter.get(),
+                        unit='ms' if self.unit.get() == '毫秒' else 's')
         except ControllerError as exc:
             self.notice.set(str(exc))
             return
