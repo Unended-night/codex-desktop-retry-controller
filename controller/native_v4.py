@@ -357,8 +357,9 @@ def http_budget(ins, index, data, off):
         raise ValueError('HTTP attempt load changed')
     counter, state = load.operands[0].reg, load.operands[1].mem.base
     attempt = load.operands[1].mem.disp
-    if counter not in nonvolatile or state not in nonvolatile or counter == state:
-        raise ValueError('HTTP state/counter must survive calls')
+    if (counter not in nonvolatile or state not in families
+            or state in (x.X86_REG_RBP, x.X86_REG_RSP, counter)):
+        raise ValueError('HTTP counter must survive calls and use distinct state')
     if not (compare.mnemonic == 'cmp' and reg(compare.operands[0], counter)
             and compare.operands[0].size == 8 and mem(compare.operands[1], state)
             and compare.operands[1].size == 8 and not overlaps(compare.operands[1].mem.disp, attempt)
@@ -398,8 +399,8 @@ def http_budget(ins, index, data, off):
             and reject.mnemonic == 'jae' and reject.operands[0].type == 2
             and reject.operands[0].imm in boundaries and reject.operands[0].imm > reject.address):
         raise ValueError('HTTP error range changed')
-    if any(writes(i, state) or writes(i, counter) for i in ins[index+2:index+9]):
-        raise ValueError('HTTP normalization overwrites retry state/counter')
+    if any(writes(i, counter) for i in ins[index+2:index+9]):
+        raise ValueError('HTTP normalization overwrites retry counter')
 
     # The tag must come from this same state, directly or via LEA + load.
     tag = copy.operands[1].reg
@@ -430,12 +431,11 @@ def http_budget(ins, index, data, off):
         raise ValueError('HTTP tag overlaps retry budget/attempt')
     if any(writes(i,state) for i in previous[origin:]):
         raise ValueError('HTTP retry state overwritten')
-    # Volatile tags cannot survive a call; the retry state is nonvolatile.
     if any(i.mnemonic == 'call' for i in previous[source+1:]) and tag not in nonvolatile:
         raise ValueError('HTTP error tag clobbered by call')
 
     # On fallthrough the same counter is incremented and persisted for the
-    # delay calculation. Calls may occur, but cannot clobber these registers.
+    # delay calculation. The state pointer may be copied or reloaded meanwhile.
     tail = ins[index+9:index+41]
     increment = next((n for n,i in enumerate(tail) if writes(i,counter)), None)
     if increment is None:
@@ -446,12 +446,67 @@ def http_budget(ins, index, data, off):
     store = tail[increment+1] if increment+1 < len(tail) else None
     if not (inc.mnemonic == 'inc' and reg(inc.operands[0],counter)
             and inc.operands[0].size == 8 and store and store.mnemonic == 'mov'
-            and mem(store.operands[0],state) and store.operands[0].size == 8
+            and mem(store.operands[0]) and store.operands[0].size == 8
             and reg(store.operands[1],counter)
             and not any(overlaps(store.operands[0].mem.disp,f)
-                        for f in (attempt,compare.operands[1].mem.disp,tag_field))
-            and not any(writes(i,state) for i in tail[:increment+1])):
+                        for f in (attempt,compare.operands[1].mem.disp,tag_field))):
         raise ValueError('HTTP next-attempt state disagrees')
+
+    # Track the object's identity, not a register's lifetime. A compiler may
+    # reuse the budget's volatile base for classification and reload the object
+    # from its frame slot into a nonvolatile register before the next call.
+    # Only full-width copies and a proven, unchanged frame slot preserve it.
+    begin = max(0,index-7) + origin
+    producer = next((n for n in range(begin-1,max(-1,begin-13),-1)
+                     if writes(ins[n],state) or ins[n].mnemonic == 'call'
+                     or ins[n].mnemonic.startswith('j')),None)
+    spill = None
+    if producer is not None:
+        i = ins[producer]
+        if (i.mnemonic == 'mov' and reg(i.operands[0],state) and i.operands[0].size == 8
+                and mem(i.operands[1]) and i.operands[1].size == 8
+                and i.operands[1].mem.base in (x.X86_REG_RBP,x.X86_REG_RSP)):
+            spill = (i.operands[1].mem.base,i.operands[1].mem.disp)
+            begin = producer + 1
+    live = {state}
+    for i in ins[begin:index+9+increment+1]:
+        if i.address == compare.address and state not in live:
+            raise ValueError('HTTP budget state lost before comparison')
+        # This bounded proof follows fallthrough with outward conditional exits.
+        # Internal edges could bypass a reload or merge different state values.
+        if (i.mnemonic in ('jmp','ret','retf','int3','ud2')
+                or (i.mnemonic.startswith('j') and
+                    (i.operands[0].type != 2 or i.operands[0].imm <= store.address))):
+            raise ValueError('HTTP state flow has an unproven branch')
+        value = None
+        if (i.mnemonic == 'mov' and i.operands[0].type == 1 and i.operands[0].size == 8
+                and i.operands[1].size == 8):
+            src = i.operands[1]
+            if ((src.type == 1 and src.reg in live)
+                    or (spill is not None and mem(src,*spill))):
+                value = i.operands[0].reg
+        if spill is not None:
+            frame, displacement = spill
+            # Do not assume a slot survives frame changes, overlapping stores,
+            # escaped frame addresses or the Windows x64 call scratch area.
+            if ((i.mnemonic != 'call' and writes(i,frame))
+                    or any(o.type == 3 and o.mem.base == frame and
+                           (not mem(o,frame) or (o.access & 2 and
+                            o.mem.disp < displacement+8 and displacement < o.mem.disp+o.size))
+                           for o in i.operands)
+                    or (i.mnemonic == 'lea' and i.operands[1].type == 3
+                        and i.operands[1].mem.base == frame)
+                    or (i.mnemonic == 'mov' and i.operands[1].type == 1
+                        and i.operands[1].reg in families[frame])
+                    or (i.mnemonic == 'call' and frame == x.X86_REG_RSP and displacement < 32)):
+                spill = None
+        live = {r for r in live if not writes(i,r)}
+        if i.mnemonic == 'call':
+            live.intersection_update(nonvolatile)
+        if value is not None:
+            live.add(value)
+    if store.operands[0].mem.base not in live:
+        raise ValueError('HTTP next-attempt state provenance lost')
     safe_ranges(ins,[(compare.address,compare.address+compare.size)],data,off)
     return dict(http=compare.address,http_size=compare.size)
 

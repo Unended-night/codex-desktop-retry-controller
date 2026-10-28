@@ -355,6 +355,78 @@ class OutlinedTests(unittest.TestCase):
                 with self.subTest(change=after),self.assertRaises(ValueError):
                     self.http_layout(raw.replace(bytes.fromhex(before),bytes.fromhex(after),1))
 
+    def http_reloaded_fragment(self):
+        # State starts in RAX, classification reuses RAX, then the same frame
+        # slot supplies RSI. R12 is the counter across the intervening call.
+        return bytes.fromhex('488b4528488b58204883fb0c7400'
+            '4c8b60104c3b60087300'
+            '4889d94883e904b801000000480f4dc18d48fd83f9037300'
+            '488b7528e80000000049ffc44c896630c3')
+
+    def test_http_gate_tracks_reloaded_state_across_register_and_frame_changes(self):
+        raw=self.http_reloaded_fragment()
+        variants=[raw,
+                  raw.replace(bytes.fromhex('488b4528'),bytes.fromhex('488b4548'))
+                     .replace(bytes.fromhex('488b7528'),bytes.fromhex('488b7548')),
+                  raw.replace(bytes.fromhex('488b4528'),bytes.fromhex('488b442440'))
+                     .replace(bytes.fromhex('488b7528'),bytes.fromhex('488b742440')),
+                  raw.replace(bytes.fromhex('488b4528'),bytes.fromhex('4c8b5528'))
+                     .replace(bytes.fromhex('488b5820'),bytes.fromhex('498b5a20'))
+                     .replace(bytes.fromhex('4c8b60104c3b6008'),bytes.fromhex('4d8b62104d3b6208')),
+                  raw.replace(bytes.fromhex('488b7528'),bytes.fromhex('4c8b6d28'))
+                     .replace(bytes.fromhex('4c896630'),bytes.fromhex('4d896530')),
+                  raw.replace(bytes.fromhex('480f4dc1'),bytes.fromhex('480f43c1'))]
+        for variant in variants:
+            for address in (0x2000,0x12342000):
+                with self.subTest(raw=variant.hex(),address=address):
+                    self.http_layout(variant,address)
+
+    def test_http_gate_tracks_full_register_copies_of_state(self):
+        raw=self.http_reloaded_fragment()
+        # Preserve RAX in R13 before normalization, then copy R13 to RSI.
+        raw=raw.replace(bytes.fromhex('4c8b6010'),bytes.fromhex('4989c54c8b6010'))
+        raw=raw.replace(bytes.fromhex('488b7528'),bytes.fromhex('4c89ee'))
+        self.http_layout(raw)
+        with self.assertRaises(ValueError):
+            self.http_layout(raw.replace(bytes.fromhex('4c89ee'),bytes.fromhex('4489ee')))
+
+    def test_http_gate_rejects_invalid_reloaded_state_provenance(self):
+        raw=self.http_reloaded_fragment()
+        changes=[('488b7528','488b7530'),             # Different source slot.
+                 ('4c896630','4d896530'),             # Different destination object.
+                 ('488b7528','48c7452800000000488b7528'),  # Overwrite source slot.
+                 ('488b7528','c6452f00488b7528'),      # Partial slot write.
+                 ('488b7528','48c7452400000000488b7528'),  # Overlapping slot write.
+                 ('488b7528','40b501488b7528'),        # Partial frame register write.
+                 ('488b7528','488d4d28488b7528'),      # Escaping slot address.
+                 ('488b7528','4889e9488b7528'),        # Escaping frame pointer.
+                 ('49ffc4','40b60149ffc4'),           # Partial final state overwrite.
+                 ('488b7528','7504488b7528'),         # Branch can bypass reload.
+                 ('4c8b6010','e8000000004c8b6010')]   # RAX lost before budget load.
+        for before,after in changes:
+            with self.subTest(change=after),self.assertRaises(ValueError):
+                self.http_layout(raw.replace(bytes.fromhex(before),bytes.fromhex(after),1))
+
+    def test_http_gate_rejects_volatile_reload_across_call(self):
+        raw=self.http_reloaded_fragment().replace(bytes.fromhex('488b7528'),bytes.fromhex('488b4d28'))
+        raw=raw.replace(bytes.fromhex('4c896630'),bytes.fromhex('4c896130'))
+        with self.assertRaises(ValueError):
+            self.http_layout(raw)
+        self.http_layout(raw.replace(bytes.fromhex('e800000000'),b''))
+
+    def test_http_gate_checks_stack_slot_survival_across_calls(self):
+        raw=self.http_reloaded_fragment()
+        raw=raw.replace(bytes.fromhex('488b7528'),bytes.fromhex('e800000000488b7528'))
+        self.http_layout(raw)
+        for displacement in (0x18,0x40):
+            variant=raw.replace(bytes.fromhex('488b4528'),bytes.fromhex('488b4424')+bytes([displacement]))
+            variant=variant.replace(bytes.fromhex('488b7528'),bytes.fromhex('488b7424')+bytes([displacement]))
+            if displacement < 32:
+                with self.assertRaises(ValueError):
+                    self.http_layout(variant)
+            else:
+                self.http_layout(variant)
+
     def test_http_gate_rejects_alias_clobbers_and_mismatched_fields(self):
         raw=self.http_fragment()
         changes=[('4889d9','4989df'),  # Normalization overwrites state.
@@ -412,7 +484,7 @@ class OutlinedTests(unittest.TestCase):
             self.http_layout(variant)
 
     def outlined_image(self, gates=1, unknown_caller=False, missing_endpoint=False,
-                       changed_enum=False, duplicate_outer=False, signed_enum=False):
+                       changed_enum=False, duplicate_outer=False, signed_enum=False, reloaded_last=False):
         """Sparse real outer fragment plus synthetic protocol-scoped gates.
 
         No log, instrumentation or function-name strings exist in this image.
@@ -442,8 +514,8 @@ class OutlinedTests(unittest.TestCase):
             add(other)
         http=[]
         references=[]
-        for _ in range(gates):
-            raw=self.http_fragment()
+        for number in range(gates):
+            raw=self.http_reloaded_fragment() if reloaded_last and number==gates-1 else self.http_fragment()
             if signed_enum:
                 raw=raw.replace(bytes.fromhex('480f43c1'),bytes.fromhex('480f4dc1'))
             if changed_enum:
@@ -496,6 +568,12 @@ class OutlinedTests(unittest.TestCase):
             patches=replacements(s,dict(max_retries=20,interval_ms=1000))
             self.assertEqual(len(patches),6)
             self.assertEqual({p[0] for p in patches[-2:]},{g['offset'] for g in s['http_sites']})
+
+    def test_locator_includes_reloaded_gate_alongside_stable_gate(self):
+        for count in (1,2):
+            sites=self.outlined_image(gates=count,reloaded_last=True)
+            self.assertEqual(len(sites['http_sites']),count)
+            self.assertEqual(len(replacements(sites,dict(max_retries=50,interval_ms=1000))),4+count)
 
     def test_locator_refuses_unproven_gate_even_when_another_gate_is_valid(self):
         for options in (dict(gates=2,unknown_caller=True),dict(missing_endpoint=True),dict(duplicate_outer=True)):
