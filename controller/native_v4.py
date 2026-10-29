@@ -203,6 +203,21 @@ def duration_branch(ins, call_index):
     return none_value, present, absent
 
 
+def field_address(i, state, field):
+    """A scheduled address calculation that leaves live scalar values intact.
+
+    Keep the instruction in place; only the pattern matcher steps over it.
+    Restrict it to a proven state field and a distinct nonvolatile register.
+    """
+    import capstone.x86_const as x
+    nonvolatile = {x.X86_REG_RBX, x.X86_REG_RSI, x.X86_REG_RDI,
+                   x.X86_REG_R12, x.X86_REG_R13, x.X86_REG_R14, x.X86_REG_R15}
+    return (i.mnemonic == 'lea' and len(i.operands) == 2
+            and i.operands[0].type == 1 and i.operands[0].size == 8
+            and i.operands[0].reg in nonvolatile - {state}
+            and mem(i.operands[1], state, field))
+
+
 def outer(ins, call_index, helper, data, off):
     import capstone.x86_const as x
     call=ins[call_index]
@@ -237,7 +252,16 @@ def outer(ins, call_index, helper, data, off):
     if not any(i.mnemonic=='mov' and reg(i.operands[0],state)
                and mem(i.operands[1],x.X86_REG_RBP,slot) for i in ins[max(0,call_index-30):call_index]):
         raise ValueError('state reload disagrees')
-    stores=ins[resume+1:resume+7]
+    cursor=resume+1
+    stores=[]
+    scheduled=[]
+    while len(stores)<6:
+        i=ins[cursor]
+        if field_address(i,resumed,next_attempt) and not scheduled:
+            scheduled.append(i)
+        else:
+            stores.append(i)
+        cursor+=1
     ssec,snano,lsec,lnano,dsec,dnano=stores
     for i,register,load in [(ssec,x.X86_REG_RAX,False),(snano,x.X86_REG_EDX,False),
                             (lsec,x.X86_REG_RAX,True),(lnano,x.X86_REG_ECX,True),
@@ -248,28 +272,36 @@ def outer(ins, call_index, helper, data, off):
     if any(a.operands[index].mem.disp+8 != b.operands[index].mem.disp
            for a,b,index in [(ssec,snano,0),(lsec,lnano,1),(dsec,dnano,0)]):
         raise ValueError('duration field pair disagrees')
-    connection=ins[resume+7]
+    connection_index=cursor
+    connection=ins[connection_index]
     if not (connection.mnemonic=='mov' and reg(connection.operands[0],x.X86_REG_RAX)
             and mem(connection.operands[1],resumed)):
         raise ValueError('connection path changed')
     counts=[]
-    for k in range(resume+8,len(ins)-15):
-        a,b,c,d,e=ins[k:k+5]
+    for k in range(connection_index+1,len(ins)-15):
+        a,b=ins[k:k+2]
+        compare_index=k+2
+        if ins[compare_index].mnemonic=='lea':
+            compare_index+=1
+        c,d,e=ins[compare_index:compare_index+3]
         if (a.mnemonic=='mov' and reg(a.operands[0],x.X86_REG_RAX) and mem(a.operands[1],resumed)
                 and b.mnemonic=='mov' and reg(b.operands[0],x.X86_REG_RCX) and mem(b.operands[1],x.X86_REG_RAX,0)
                 and c.mnemonic=='cmp' and reg(c.operands[0],x.X86_REG_RCX) and mem(c.operands[1],resumed)
                 and d.mnemonic=='jae' and d.operands[0].type==2
-                and e.mnemonic=='mov' and mem(e.operands[1],resumed,next_attempt)):
-            counts.append(k)
-    k=only(counts,'bounded budget')
+                and e.mnemonic=='mov' and mem(e.operands[1],resumed,next_attempt)
+                and (compare_index==k+2 or field_address(ins[k+2],resumed,c.operands[1].mem.disp))):
+            counts.append((k,compare_index))
+    k,compare_index=only(counts,'bounded budget')
     bounded=ins[k]
-    budget=ins[k+2].operands[1].mem.disp
-    write=ins[k+5]
+    budget=ins[compare_index].operands[1].mem.disp
+    next_load=ins[compare_index+2]
+    write_index=compare_index+3
+    write=ins[write_index]
     if not (write.mnemonic=='mov' and mem(write.operands[0],x.X86_REG_RAX,0)
-            and write.operands[1].type==1 and ins[k+4].operands[0].type==1
-            and write.operands[1].reg==ins[k+4].operands[0].reg):
+            and write.operands[1].type==1 and next_load.operands[0].type==1
+            and write.operands[1].reg==next_load.operands[0].reg):
         raise ValueError('attempt counter write disagrees')
-    tail=ins[k+5:k+18]
+    tail=ins[write_index:write_index+13]
     for field in [budget,connection.operands[1].mem.disp,ssec.operands[0].mem.disp,snano.operands[0].mem.disp]:
         if not any(i.mnemonic=='mov' and mem(i.operands[1],resumed,field) for i in tail):
             raise ValueError('bounded path fields disagree')
@@ -281,13 +313,15 @@ def outer(ins, call_index, helper, data, off):
             for source in ins[max(0,j-2):j]:
                 if source.mnemonic=='mov' and reg(source.operands[0],x.X86_REG_RAX) and mem(source.operands[1],state):
                     initial.append(source)
-    init=only(initial,'budget initialization')
-    if init.size<5 or lnano.size<5 or call.size!=5:
+    if len(initial)>1:
+        raise ValueError('ambiguous budget initialization')
+    init=initial[0] if initial else None
+    if (init is not None and init.size<5) or lnano.size<5 or call.size!=5:
         raise ValueError('insufficient instruction space')
     if not 100 <= bounded.address-connection.address <= 1024:
         raise ValueError('unexpected connection block size')
     if not any(i.mnemonic=='je' and i.operands[0].type==2 and i.operands[0].imm==bounded.address
-               for i in ins[resume+7:k]):
+               for i in ins[connection_index:k]):
         raise ValueError('missing bounded connection edge')
     # Block scheduling may put the None/cleanup branch between the connection
     # exception and bounded retry blocks. Leave that live block untouched.
@@ -298,9 +332,9 @@ def outer(ins, call_index, helper, data, off):
     families = register_families()
     def writes(i, register):
         return bool(set(i.regs_access()[1]).intersection(families[register]))
-    setup = ins[k:k+18]
+    setup = ins[k:write_index+13]
     first_call = next((n for n,i in enumerate(setup) if i.mnemonic=='call'),len(setup))
-    skipped = ins[resume+7:addresses[connection_end]]
+    skipped = ins[connection_index:addresses[connection_end]]
     reloads = [(n,i) for n,i in enumerate(skipped) if i.mnemonic=='mov'
                and reg(i.operands[0],x.X86_REG_R8) and i.operands[0].size==8
                and mem(i.operands[1],x.X86_REG_RBP) and i.operands[1].size==8]
@@ -325,14 +359,64 @@ def outer(ins, call_index, helper, data, off):
                 and source.operands[1].size==8):
             raise ValueError('bounded error reload disagrees with classifier argument')
         bounded_reload = bytes(reload.bytes)
-    ranges=[(call.address,call.address+call.size),(init.address,init.address+init.size),
+    # Imported state uses a short redirect to the appended helper. Do not use
+    # the intervening connection blocks as scratch space: jump-table resume
+    # targets may be interleaved with them.
+    if init is None:
+        if connection.size<5:
+            raise ValueError('insufficient imported budget redirect space')
+        connection_end=connection.address+connection.size
+    ranges=[(call.address,call.address+call.size),
             (lnano.address,lnano.address+lnano.size),(connection.address,connection_end)]
+    if init is not None:
+        ranges.append((init.address,init.address+init.size))
+    else:
+        # Some builds construct/copy the sampling state in a separate function.
+        # Set only the proven budget field on the retry path, before its gate.
+        # Require the native reporting call and all its budget/Duration loads.
+        if first_call==len(setup) or setup[first_call].operands[0].type!=2:
+            raise ValueError('imported budget has no direct retry reporting call')
+        if not bounded_reload:
+            argument=ins[call_index-1]
+            if not (argument.mnemonic=='mov' and reg(argument.operands[0],x.X86_REG_RCX)):
+                raise ValueError('imported budget classifier error argument changed')
+            source=argument
+            if argument.operands[1].type==1:
+                error=argument.operands[1].reg
+                source=next((i for i in reversed(ins[max(0,call_index-30):call_index-1])
+                             if writes(i,error)),None)
+            error_reload=next((i for i in reversed(setup[:first_call]) if writes(i,x.X86_REG_R8)),None)
+            if not (source and source.mnemonic=='mov' and mem(source.operands[1],x.X86_REG_RBP)
+                    and source.operands[1].size==8
+                    and error_reload and error_reload.mnemonic=='mov'
+                    and reg(error_reload.operands[0],x.X86_REG_R8)
+                    and mem(error_reload.operands[1],x.X86_REG_RBP,source.operands[1].mem.disp)
+                    and error_reload.operands[1].size==8):
+                raise ValueError('imported budget error reload disagrees with classifier argument')
+        fields=[(budget,8),(next_attempt,8),(bounded.operands[1].mem.disp,8),
+                (connection.operands[1].mem.disp,8),
+                (ssec.operands[0].mem.disp,8),(snano.operands[0].mem.disp,4),
+                (lsec.operands[1].mem.disp,8),(lnano.operands[1].mem.disp,4),
+                (dsec.operands[0].mem.disp,8),(dnano.operands[0].mem.disp,4)]
+        if any(a<b+bs and b<a+size for n,(a,size) in enumerate(fields) for b,bs in fields[n+1:]):
+            raise ValueError('overlapping sampling state fields')
+        if ins[compare_index].operands[1].size!=8:
+            raise ValueError('sampling budget is not a full counter')
+        if reload.reg_name(resumed) not in ('rbx','rsi','rdi','r12','r13','r14','r15'):
+            raise ValueError('sampling state must survive the policy call')
     safe_ranges(ins,ranges,data,off)
-    return dict(call=call.address,continuation=call.address+call.size,
-                init=init.address,init_size=init.size,deadline=lnano.address,deadline_size=lnano.size,
+    result=dict(call=call.address,continuation=call.address+call.size,
+                deadline=lnano.address,deadline_size=lnano.size,
                 connection=connection.address,connection_end=connection_end,
                 bounded=bounded.address,bounded_reload=bounded_reload,
                 prefix=helper,none_value=none_value)
+    if init is not None:
+        result.update(init=init.address,init_size=init.size)
+    else:
+        result.update(budget_field=budget,state_register=reload.reg_name(resumed),
+                      reporter=setup[first_call].operands[0].imm,
+                      helper=call.operands[0].imm)
+    return result
 
 
 def http_budget(ins, index, data, off):
@@ -660,7 +744,20 @@ def locate_outlined(data, function, off, va, refs, cs, *, has_reference=None, re
             candidates.append(outer(ins,n,classifier(helper,none_value),data,off))
         except (ValueError,KeyError,IndexError,StopIteration):
             continue
-    result=only(candidates,'sampling policy')
+    initialized=[s for s in candidates if 'init' in s]
+    if initialized:
+        result=only(initialized,'sampling policy')
+    else:
+        if not candidates:
+            raise ValueError('outlined sampling policy: expected one, found 0')
+        # Separate instantiations of the same retry loop may import their
+        # budget rather than initialize it locally. All must agree on both
+        # native helpers and classification; patch every proven instance.
+        identities={(s['helper'],s['reporter'],s['prefix'],s['none_value']) for s in candidates}
+        only(list(identities),'imported sampling policy helpers')
+        if len({s['call'] for s in candidates})!=len(candidates):
+            raise ValueError('duplicate sampling call site')
+        result=dict(candidates[0],sampling_sites=candidates)
     http={}
     graph=ResponsesCallGraph(data,function,off,va,refs,reference_candidates)
     # SUB r64, imm8/imm32; MOV r32, imm32; CMOVAE/CMOVGE r64, r64. The
@@ -691,12 +788,31 @@ def locate_outlined(data, function, off, va, refs, cs, *, has_reference=None, re
     result['http_sites']=[http[k] for k in sorted(http)]
     result.update(result['http_sites'][0])
     result['family']='responses-sampling-x64-outlined'
-    result['offsets']={k:off(result[k]) for k in ('call','init','deadline','connection','http')}
+    for site in result.get('sampling_sites',[result]):
+        site['offsets']={k:off(site[k]) for k in ('call','init','deadline','connection') if k in site}
+    result['offsets']={k:off(result[k]) for k in ('call','init','deadline','connection','http') if k in result}
     return result
 
 
 def jmp(source,target,opcode=b'\xe9'):
     return opcode+struct.pack('<i',target-source-len(opcode)-4)
+
+
+def imported_budget_code(s, p, address):
+    """Assign just the proven u64 budget, then enter its original gate.
+
+    The state reload and all scheduled field addresses still execute in situ.
+    No stack, flags or register values are changed by the assignment.
+    """
+    registers=('rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi',
+               'r8','r9','r10','r11','r12','r13','r14','r15')
+    base=registers.index(s['state_register'])
+    code=bytes([0x48 | (base>>3),0xc7,0x80 | (base&7)])
+    if base&7==4:
+        code+=b'\x24'  # SIB: no index, R12 base.
+    code+=struct.pack('<iI',s['budget_field'],p['max_retries'])
+    code+=s['bounded_reload']
+    return code+jmp(address+len(code),s['bounded'])
 
 
 def delay_code(p):

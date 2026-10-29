@@ -14,7 +14,7 @@ sys.path.insert(0,str(ROOT/'research/.deps'))
 import capstone
 from controller.native import _file_address_map, _mapped_va, _relative_reference_candidates
 from controller.native_v4 import (classifier, duration_branch, http_budget, locate_outlined, outer,
-                                  protocol_slice, replacements, responses_transport, safe_ranges)
+                                  imported_budget_code, protocol_slice, replacements, responses_transport, safe_ranges)
 from controller import native
 
 
@@ -509,8 +509,91 @@ class OutlinedTests(unittest.TestCase):
         for variant in (raw,changed):
             self.http_layout(variant)
 
+    def imported_outer(self, scheduled=False, shift=0):
+        address=0x5000+shift
+        data=bytearray()
+        labels={}
+        jumps=[]
+        def emit(raw):data.extend(bytes.fromhex(raw))
+        def jump(opcode,target):
+            emit(opcode);jumps.append((len(data),target));data.extend(b'\0'*4)
+        emit('488b75284c8b6d2049895530')  # Error/state reloads and saved next attempt.
+        # Keep the error argument immediately before the classifier call.
+        emit('4889f1')
+        call=address+len(data)
+        data.extend(b'\xe8'+struct.pack('<i',0x3000+shift-call-5))
+        emit('9081fa00ca9a3b');jump('0f84','absent')
+        emit('4c8b7d20')
+        if scheduled:emit('498d7730')
+        emit('4989474041895748498b4750418b8f580000004989476041894f68')
+        labels['connection']=address+len(data)
+        emit('498b87200000004885c0');jump('0f84','bounded')
+        data.extend(b'\x90'*128)
+        labels['absent']=address+len(data)
+        emit('c3')
+        labels['bounded']=address+len(data)
+        emit('498b4708488b08')
+        if scheduled:emit('498d7f10')
+        emit('493b4f10');jump('0f83','end')
+        emit('4d8b4f304c8908498b4710498b4720498b4740418b4f48')
+        # Windows error argument and a direct native retry reporter.
+        emit('4c8b4528')
+        source=address+len(data)
+        data.extend(b'\xe8'+struct.pack('<i',0x4000+shift-source-5))
+        data.extend(b'\x90'*20)
+        labels['end']=address+len(data);emit('c3')
+        for at,target in jumps:struct.pack_into('<i',data,at,labels[target]-address-at-4)
+        return data,address,call,labels
+
+    def imported_layout(self,scheduled=False,shift=0,mutate=None):
+        data,address,call,labels=self.imported_outer(scheduled,shift)
+        if mutate:data=mutate(data)
+        ins=self.decode(data,address)
+        index=next(n for n,i in enumerate(ins) if i.address==call)
+        s=outer(ins,index,classifier(self.decode(self.helper(),0x3000)),data,lambda va:va-address)
+        return s,data,address,labels
+
+    def test_imported_sampling_budget_preserves_scheduled_instructions_and_live_blocks(self):
+        for scheduled in (False,True):
+            for shift in (0,0x12340000):
+                s,data,address,labels=self.imported_layout(scheduled,shift)
+                self.assertNotIn('init',s)
+                self.assertEqual((s['budget_field'],s['state_register']),(0x10,'r15'))
+                self.assertEqual(s['reporter'],0x4000+shift)
+                self.assertEqual(s['connection_end']-s['connection'],7)
+                # Only the first load is selected, never the cleanup body.
+                self.assertLess(s['connection_end'],labels['absent'])
+
+    def test_imported_sampling_refuses_field_overlap_wrong_address_and_missing_reporter(self):
+        for before,after in [('493b4f10','493b4f30'),('498d7730','498d7738'),
+                             ('498d7f10','498d7f18'),('4c8b7d20','4c8b7d28'),
+                             ('4c8b4528','4c8b4530'),('498b8720000000','498b4720909090')]:
+            with self.subTest(change=after),self.assertRaises(ValueError):
+                self.imported_layout(True,mutate=lambda raw:raw.replace(bytes.fromhex(before),bytes.fromhex(after),1))
+        def no_reporter(raw):
+            ins=self.decode(raw,0x5000)
+            call=next(i for i in ins if i.mnemonic=='call' and i.operands[0].imm==0x4000)
+            raw[call.address-0x5000:call.address-0x5000+5]=b'\x90'*5
+            return raw
+        with self.assertRaisesRegex(ValueError,'reporting call'):
+            self.imported_layout(mutate=no_reporter)
+
+    def test_imported_budget_emitter_handles_all_supported_bases_and_field_displacements(self):
+        for register in ('rbx','rsi','rdi','r12','r13','r14','r15'):
+            for field in (-0x100,0x10,0x12340):
+                s=dict(state_register=register,budget_field=field,bounded_reload=b'',bounded=0x3000)
+                for retries in (0,300,1_000_000):
+                    ins=self.decode(imported_budget_code(s,dict(max_retries=retries),0x2000),0x2000)
+                    self.assertEqual(len(ins),2)
+                    self.assertEqual(ins[0].mnemonic,'mov')
+                    dst,value=ins[0].operands
+                    self.assertEqual((ins[0].reg_name(dst.mem.base),dst.mem.disp,dst.size,value.imm),
+                                     (register,field,8,retries))
+                    self.assertEqual(ins[1].operands[0].imm,0x3000)
+
     def outlined_image(self, gates=1, unknown_caller=False, missing_endpoint=False,
-                       changed_enum=False, duplicate_outer=False, signed_enum=False, reloaded_last=False, optimized=False):
+                       changed_enum=False, duplicate_outer=False, signed_enum=False, reloaded_last=False,
+                       optimized=False, imported=False, mismatched_reporter=False):
         """Sparse real outer fragment plus synthetic protocol-scoped gates.
 
         No log, instrumentation or function-name strings exist in this image.
@@ -519,10 +602,11 @@ class OutlinedTests(unittest.TestCase):
         base=0x100000
         data=bytearray()
         functions=[]
-        outer_raw=bytearray.fromhex(self.fixture['outer']['hex'])
+        outer_raw=(self.imported_outer(True)[0] if imported else bytearray.fromhex(self.fixture['outer']['hex']))
         original=self.decode(outer_raw,base)
+        target=(0x3000-0x5000+base if imported else self.fixture['helper']['va']-self.fixture['outer']['va']+base)
         call=next(i for i in original if i.mnemonic=='call' and
-                  i.operands[0].imm==self.fixture['helper']['va']-self.fixture['outer']['va']+base)
+                  i.operands[0].imm==target)
         helper_raw=bytes.fromhex(self.fixture['helper']['hex'])
         helper_at=len(outer_raw)+16
         struct.pack_into('<i',outer_raw,call.address-base+1,helper_at-(call.address-base)-5)
@@ -537,6 +621,11 @@ class OutlinedTests(unittest.TestCase):
         if duplicate_outer:
             other=bytearray(outer_raw)
             struct.pack_into('<i',other,call.address-base+1,helper_at-len(data)-(call.address-base)-5)
+            if imported:
+                reporter=next(i for i in original if i.mnemonic=='call' and i.address!=call.address)
+                at=reporter.address-base+1
+                displacement=struct.unpack_from('<i',other,at)[0]-len(data)
+                struct.pack_into('<i',other,at,displacement+(1 if mismatched_reporter else 0))
             add(other)
         http=[]
         references=[]
@@ -589,6 +678,13 @@ class OutlinedTests(unittest.TestCase):
         for options in (dict(unknown_caller=True),dict(missing_endpoint=True)):
             with self.subTest(options=options),self.assertRaises(ValueError):
                 self.outlined_image(gates=2,optimized=True,**options)
+
+    def test_locator_collects_imported_sampling_instances_with_the_same_native_helpers(self):
+        s=self.outlined_image(imported=True,duplicate_outer=True,gates=2)
+        self.assertEqual(len(s['sampling_sites']),2)
+        self.assertEqual(len(s['http_sites']),2)
+        with self.assertRaisesRegex(ValueError,'helpers'):
+            self.outlined_image(imported=True,duplicate_outer=True,mismatched_reporter=True)
 
     def test_locator_needs_no_log_or_function_names(self):
         for changed_enum in (False,True):

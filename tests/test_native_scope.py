@@ -6,11 +6,12 @@ import struct
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'research/.deps'))
 import capstone
-from controller.native_errors import invalid_request_layout, name_references
+from controller.native_errors import debug_dispatch_source, invalid_request_layout, locate_invalid_request, name_references
 from controller.native_compact import compact_sites
 from controller.native_extension import layout,section_patches
 
@@ -71,6 +72,38 @@ class ScopeStructureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'reference formatter'):
             self.error_layout()
 
+    def test_dispatch_source_handles_reallocated_registers_and_later_niche_constant(self):
+        import capstone.x86_const as x
+        # RAX holds the original tag; JNE skips the special formatter arm.
+        raw=bytes.fromhex('4889cf488b0148b902000000000000804839c87501c3'
+                          '48b900000000000000804831c1')
+        ins=list(self.cs.disasm(raw,0x1000))
+        self.assertEqual(debug_dispatch_source(ins,len(ins)-1,x.X86_REG_RCX,x.X86_REG_RAX),2)
+        for before,after in [('488b01','488b09'),('4889cf','4889d7'),('7501','7401'),
+                             ('4839c8','4885c0'),('488b01','8b0190')]:
+            changed=raw.replace(bytes.fromhex(before),bytes.fromhex(after),1)
+            body=list(self.cs.disasm(changed,0x1000))
+            with self.subTest(change=after),self.assertRaises(ValueError):
+                debug_dispatch_source(body,len(body)-1,x.X86_REG_RCX,x.X86_REG_RAX)
+
+    def test_invalid_request_name_can_be_pooled_next_to_printable_text(self):
+        data,original_off=self.environment()
+        c=self.chunks['error'];ins=list(self.cs.disasm(c['raw'],c['address']))
+        name=next(i for i in ins if i.address==self.fixture['error_name'])
+        string_va=name.address+0x100000
+        string_at=len(data)
+        data.extend(b'InvalidRequestAdjacentLiteral')
+        at=original_off(name.address)+name.disp_offset
+        struct.pack_into('<i',data,at,string_va-name.address-name.size)
+        ins=list(self.cs.disasm(data[:len(c['raw'])],c['address']))
+        def off(address):return string_at if address==string_va else original_off(address)
+        def va(offset):return string_va if offset==string_at else c['address']+offset
+        def function(offset):return (c['address'],c['address']+len(c['raw'])),ins
+        with patch('controller.native_errors.classifier_flow',return_value=self.fixture['classification']):
+            result=locate_invalid_request(data,dict(prefix=b'',none_value=1_000_000_000),
+                function,off,va,self.cs,[(0,len(c['raw']),c['address'])])
+        self.assertEqual(result,dict(tag=(1<<63)|15,pointer=16,length=24))
+
     def compact(self,raw=None,delta=0):
         c=self.chunks['compact'];raw=c['raw'] if raw is None else raw
         ins=list(self.cs.disasm(raw,c['address']+delta))
@@ -86,6 +119,26 @@ class ScopeStructureTests(unittest.TestCase):
         raw=bytearray(c['raw']);i=ins[n-4]
         raw[i.address-c['address']+i.imm_offset: i.address-c['address']+i.imm_offset+i.imm_size]=bytes(i.imm_size)
         with self.assertRaises(ValueError):self.compact(raw)
+
+    def test_compaction_pointer_reload_must_match_original_state_slot(self):
+        raw=bytearray.fromhex('90909090b805000000480f45c2488b4d20'
+            '4889413048c7413800000000488b7520'
+            '488b4e38483b4e300f8300000000'
+            '488b4520488d703848ffc148890ee80000000090'
+            '4c8b4520498d48304989404041895048c3')
+        ins=list(self.cs.disasm(raw,0x1000))
+        branch=next(i for i in ins if i.mnemonic=='jae')
+        struct.pack_into('<i',raw,branch.address-0x1000+branch.imm_offset,
+                         ins[-1].address-branch.address-branch.size)
+        def analyze(data):
+            body=list(self.cs.disasm(data,0x1000))
+            call=next(n for n,i in enumerate(body) if i.mnemonic=='call')
+            return compact_sites(body,call,data,lambda va:va-0x1000)
+        self.assertIn('init',analyze(raw))
+        for before,after in [('488b4520','488b4528'),('488d7038','488d7030'),
+                             ('488b4520','488b4d20'),('488b7520','8b752090')]:
+            with self.subTest(change=after),self.assertRaises(ValueError):
+                analyze(raw.replace(bytes.fromhex(before),bytes.fromhex(after),1))
 
 
 class NameReferenceTests(unittest.TestCase):

@@ -3,11 +3,77 @@ import re
 import struct
 
 from .native_extension import Code
-from .native_v4 import classifier_flow, delay_code, mem, only, reg
+from .native_v4 import classifier_flow, delay_code, mem, only, reg, register_families
 
 AZURE_RESOURCE_MESSAGE = ('The requested item was created under a different Azure OpenAI resource. '
                           'Use the same resource that created the item to access it.')
 ENCRYPTED_CONTENT_CODE = 'invalid_encrypted_content'
+
+
+def debug_dispatch_source(ins, stop, normalized, tag_register):
+    """Follow the dispatch entry, including a separately formatted special tag.
+
+    Register allocation and placement of the niche constant may change. Only
+    a JNE comparing the original tag with a niche variant can bypass a Debug
+    arm; calls, other branches and lost tag/object provenance are refused.
+    """
+    import capstone.x86_const as x
+    families=register_families()
+    aliases={alias:full for full,group in families.items() for alias in group}
+    values={x.X86_REG_RCX:('object',)}
+    addresses={i.address:n for n,i in enumerate(ins)}
+    compare=None
+    bypass=None
+    n=0
+    visits=set()
+    def read(op):
+        if op.type==2:
+            return ('constant',op.imm & ((1<<(op.size*8))-1))
+        if op.type==1 and op.size==8:
+            return values.get(aliases.get(op.reg))
+        if (op.type==3 and op.size==8 and mem(op,disp=0)
+                and values.get(op.mem.base)==('object',)):
+            return ('tag',)
+        return None
+    while n<stop:
+        if n in visits:
+            raise ValueError('error dispatch entry cycle')
+        visits.add(n)
+        i=ins[n]
+        if i.mnemonic.startswith('j'):
+            if not (i.mnemonic=='jne' and i.operands[0].type==2 and compare is not None
+                    and bypass is None and 1<<63 <= compare < (1<<63)+64):
+                raise ValueError('error dispatch entry changed')
+            bypass=compare-(1<<63)
+            n=addresses.get(i.operands[0].imm,len(ins))
+            continue
+        if i.mnemonic in ('call','ret'):
+            raise ValueError('error dispatch entry changed')
+        value=None
+        if i.mnemonic in ('mov','movabs') and len(i.operands)==2:
+            value=read(i.operands[1])
+        elif i.mnemonic=='lea' and mem(i.operands[1]):
+            source=values.get(i.operands[1].mem.base)
+            if source is not None and source[0]=='constant':
+                value=('constant',(source[1]+i.operands[1].mem.disp)&((1<<64)-1))
+        writes=i.regs_access()[1]
+        if x.X86_REG_EFLAGS in writes:
+            compare=None
+        if i.mnemonic=='cmp':
+            pair=[read(o) for o in i.operands]
+            if ('tag',) in pair:
+                other=pair[1-pair.index(('tag',))]
+                if other is not None and other[0]=='constant':compare=other[1]
+        for register in writes:
+            values.pop(aliases.get(register),None)
+        if (value is not None and i.operands[0].type==1 and i.operands[0].size in (4,8)
+                and (i.operands[0].size==8 or value[0]=='constant')):
+            values[aliases.get(i.operands[0].reg)]=value
+        n+=1
+    if not (n==stop and values.get(normalized)==('constant',1<<63)
+            and values.get(tag_register)==('tag',) and values.get(x.X86_REG_RDI)==('object',)):
+        raise ValueError('error object/tag source changed')
+    return bypass
 
 
 def invalid_request_layout(ins, name_index, data, off, function, classification):
@@ -48,47 +114,25 @@ def invalid_request_layout(ins, name_index, data, off, function, classification)
     tables=[]
     for k in range(n-7):
         a,b,c,d,e,f,g,h=ins[k:k+8]
-        if (a.mnemonic=='xor' and reg(a.operands[0],x.X86_REG_RAX) and reg(a.operands[1],x.X86_REG_RCX)
-                and b.mnemonic=='test' and all(reg(o,x.X86_REG_RCX) for o in b.operands)
-                and c.mnemonic=='mov' and reg(c.operands[0],x.X86_REG_ECX)
+        if not (a.mnemonic=='xor' and all(o.type==1 and o.size==8 for o in a.operands)):
+            continue
+        normalized,tag_register=(o.reg for o in a.operands)
+        aliases=register_families()
+        if (normalized!=tag_register
+                and b.mnemonic=='test' and all(reg(o,tag_register) and o.size==8 for o in b.operands)
+                and c.mnemonic=='mov' and reg(c.operands[0],aliases[tag_register][1])
                 and c.operands[1].type==2 and c.operands[1].imm==classification['default_tag']
-                and d.mnemonic=='cmovs' and reg(d.operands[0],x.X86_REG_RCX) and reg(d.operands[1],x.X86_REG_RAX)
-                and e.mnemonic=='lea' and reg(e.operands[0],x.X86_REG_RAX) and mem(e.operands[1],x.X86_REG_RIP)
-                and f.mnemonic=='movsxd' and reg(f.operands[0],x.X86_REG_RCX)
-                and f.operands[1].type==3 and f.operands[1].mem.base==x.X86_REG_RAX
-                and f.operands[1].mem.index==x.X86_REG_RCX and f.operands[1].mem.scale==4
+                and d.mnemonic=='cmovs' and reg(d.operands[0],tag_register) and reg(d.operands[1],normalized)
+                and e.mnemonic=='lea' and reg(e.operands[0],normalized) and mem(e.operands[1],x.X86_REG_RIP)
+                and f.mnemonic=='movsxd' and reg(f.operands[0],tag_register)
+                and f.operands[1].type==3 and f.operands[1].mem.base==normalized
+                and f.operands[1].mem.index==tag_register and f.operands[1].mem.scale==4
                 and f.operands[1].mem.disp==0
-                and g.mnemonic=='add' and reg(g.operands[0],x.X86_REG_RCX) and reg(g.operands[1],x.X86_REG_RAX)
-                and h.mnemonic=='jmp' and reg(h.operands[0],x.X86_REG_RCX)):
-            tables.append((k,e.address+e.size+e.operands[1].mem.disp))
-    k,table=only(tables,'InvalidRequest dispatch')
-    # Prove RCX still holds the error tag and RDI still points to its object.
-    prefix=ins[:k]
-    constants=[i for i in prefix if i.mnemonic in ('mov','movabs')
-               and reg(i.operands[0],x.X86_REG_RAX) and i.operands[1].type==2
-               and i.operands[1].imm & ((1<<64)-1)==1<<63]
-    constant=only(constants,'error niche constant')
-    start=addresses[constant.address]
-    load=ins[start+1]
-    if not (load.mnemonic=='mov' and reg(load.operands[0],x.X86_REG_RCX)
-            and mem(load.operands[1],x.X86_REG_RCX,0)
-            and any(i.mnemonic=='mov' and reg(i.operands[0],x.X86_REG_RDI)
-                    and reg(i.operands[1],x.X86_REG_RCX) for i in ins[:start])):
-        raise ValueError('error object/tag source changed')
-    # The optional special Debug arm must branch directly to normalization;
-    # no path to the dispatch may change the original tag or niche constant.
-    between=ins[start+2:k]
-    if between:
-        if not (len(between)>=3 and between[0].mnemonic=='lea'
-                and reg(between[0].operands[0],x.X86_REG_RDX)
-                and mem(between[0].operands[1],x.X86_REG_RAX)
-                and between[1].mnemonic=='cmp' and reg(between[1].operands[0],x.X86_REG_RCX)
-                and reg(between[1].operands[1],x.X86_REG_RDX)
-                and between[2].mnemonic=='jne' and between[2].operands[0].imm==ins[k].address):
-            raise ValueError('error dispatch entry changed')
-        bypass_tag=between[0].operands[1].mem.disp
-    else:
-        bypass_tag=None
+                and g.mnemonic=='add' and reg(g.operands[0],tag_register) and reg(g.operands[1],normalized)
+                and h.mnemonic=='jmp' and reg(h.operands[0],tag_register)):
+            bypass=debug_dispatch_source(ins,k,normalized,tag_register)
+            tables.append((k,e.address+e.size+e.operands[1].mem.disp,bypass))
+    k,table,bypass_tag=only(tables,'InvalidRequest dispatch')
     tags=[]
     for index in range(64):
         target=table+struct.unpack_from('<i',data,off(table)+index*4)[0]
@@ -149,9 +193,10 @@ def locate_invalid_request(data, s, function, off, va, cs, regions):
     if any('rcx' in [i.reg_name(r) for r in i.regs_access()[1]] for i in prefix):
         raise ValueError('retry classifier no longer preserves error pointer')
     results=[]
-    # Name length and data flow are checked below. The trailing byte avoids
-    # scanning unrelated InvalidRequestException/Access symbols in other SDKs.
-    targets={va(match.start()) for match in re.finditer(rb'InvalidRequest(?=[\x00\x01-\x1f])',data)}
+    # Rust may pool names directly next to other printable literals. The exact
+    # slice length and enum/formatter flow below, not a trailing byte, prove
+    # that this is the InvalidRequest variant rather than an SDK name prefix.
+    targets={va(match.start()) for match in re.finditer(rb'InvalidRequest',data)}
     for offsets in name_references(data,regions,targets).values():
         for at in offsets:
             try:

@@ -2,23 +2,36 @@
 import re
 import struct
 
-from .native_v4 import mem, only, reg, safe_ranges
+from .native_v4 import mem, only, reg, register_families, safe_ranges
 
 
 def compact_sites(ins, call_index, data, off):
     import capstone.x86_const as x
     call=ins[call_index]
-    load,compare,exhausted,pointer,increment,store=ins[call_index-6:call_index]
+    pointer,increment,store=ins[call_index-3:call_index]
+    gate_start=call_index-6
+    state_reload=None
+    if ins[call_index-4].mnemonic=='mov':
+        state_reload=ins[call_index-4]
+        gate_start-=1
+    load,compare,exhausted=ins[gate_start:gate_start+3]
     if not (load.mnemonic=='mov' and reg(load.operands[0],x.X86_REG_RCX)
             and mem(load.operands[1]) and load.operands[1].size==8):
         raise ValueError('compaction attempt load')
     state=load.operands[1].mem.base
     attempt=load.operands[1].mem.disp
+    pointer_state=state
+    if state_reload is not None:
+        if not (state_reload.operands[0].type==1 and state_reload.operands[0].size==8
+                and mem(state_reload.operands[1],x.X86_REG_RBP) and state_reload.operands[1].size==8
+                and state_reload.operands[0].reg!=x.X86_REG_RCX):
+            raise ValueError('compaction pointer state reload')
+        pointer_state=state_reload.operands[0].reg
     if not (compare.mnemonic=='cmp' and reg(compare.operands[0],x.X86_REG_RCX)
             and mem(compare.operands[1],state) and compare.operands[1].size==8
             and exhausted.mnemonic=='jae' and exhausted.operands[0].type==2
             and pointer.mnemonic=='lea' and pointer.operands[0].type==1
-            and mem(pointer.operands[1],state,attempt)
+            and mem(pointer.operands[1],pointer_state,attempt)
             and increment.mnemonic=='inc' and reg(increment.operands[0],x.X86_REG_RCX)
             and store.mnemonic=='mov' and mem(store.operands[0],pointer.operands[0].reg,0)
             and reg(store.operands[1],x.X86_REG_RCX)):
@@ -42,13 +55,16 @@ def compact_sites(ins, call_index, data, off):
             and reg(nanos.operands[1],x.X86_REG_EDX)):
         raise ValueError('compaction Duration stores')
     # The same saved async state must feed the gate and initialization.
-    source=next((i for i in reversed(ins[:call_index-6])
-                 if state in i.regs_access()[1]),None)
+    aliases=register_families()[state]
+    source=next((i for i in reversed(ins[:gate_start])
+                 if set(aliases).intersection(i.regs_access()[1])),None)
     if not (source and source.mnemonic=='mov' and reg(source.operands[0],state)
             and mem(source.operands[1],x.X86_REG_RBP,slot)):
         raise ValueError('compaction counter state source')
+    if state_reload is not None and not mem(state_reload.operands[1],x.X86_REG_RBP,slot):
+        raise ValueError('compaction pointer reload disagrees with counter state')
     initial=[]
-    for k,i in enumerate(ins[:call_index-6]):
+    for k,i in enumerate(ins[:gate_start]):
         if not (k>=4 and i.mnemonic=='mov' and mem(i.operands[0],x.X86_REG_RCX,budget)
                 and reg(i.operands[1],x.X86_REG_RAX)):
             continue

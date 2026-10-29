@@ -275,8 +275,8 @@ def _locate(data, error):
 def replacements(data,p,error):
     s=locate(data,error)
     if s['family']=='responses-sampling-x64-outlined':
-        from .native_v4 import replacements as outlined_replacements, delay_code, jmp
-        patches = outlined_replacements(s,p)
+        from .native_v4 import replacements as outlined_replacements, delay_code, imported_budget_code, jmp
+        patches = [] if 'sampling_sites' in s else outlined_replacements(s,p)
         from .native_errors import error_policy
         from .native_extension import section_patches
         code = error_policy(s,p)
@@ -284,8 +284,20 @@ def replacements(data,p,error):
         compact_entry = s['extension']['base']+s['extension']['rva']+len(code)
         code += delay_code(p)+b'\xc3'
         entry=s['extension']['base']+s['extension']['rva']
-        patches=[patch for patch in patches if patch[3]!='model_outer_policy']
-        patches += [(s['offsets']['call'],5,jmp(s['call'],entry,b'\xe8'),'model_outer_policy')]
+        if 'sampling_sites' in s:
+            for n,site in enumerate(s['sampling_sites']):
+                budget_entry=entry+len(code)
+                code+=imported_budget_code(site,p,budget_entry)
+                patches += [(site['offsets']['call'],5,jmp(site['call'],entry,b'\xe8'),f'model_outer_policy_{n}'),
+                            (site['offsets']['connection'],site['connection_end']-site['connection'],
+                             jmp(site['connection'],budget_entry),f'model_outer_budget_{n}'),
+                            (site['offsets']['deadline'],site['deadline_size'],
+                             b'\xb9'+struct.pack('<I',site['none_value']),f'ignore_server_deadline_{n}')]
+            for n,site in enumerate(s['http_sites']):
+                patches.append((site['offset'],site['http_size'],bytes.fromhex('39c0'),f'model_http_budget_{n+1}'))
+        else:
+            patches=[patch for patch in patches if patch[3]!='model_outer_policy']
+            patches += [(s['offsets']['call'],5,jmp(s['call'],entry,b'\xe8'),'model_outer_policy')]
         for n,site in enumerate(s['compact']):
             patches += [(site['call_offset'],5,jmp(site['call'],compact_entry,b'\xe8'),f'compact_delay_{n}'),
                         (site['init'],site['init_size'],b'\xb8'+struct.pack('<I',p['max_retries']),f'compact_budget_{n}')]
