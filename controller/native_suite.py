@@ -14,6 +14,13 @@ REQUIRED_CASES = ('zero-budget','http-fixed','http-429','quota-terminal','http-5
                   'http-403-classification','http-404-classification',
                   'millisecond-fixed')
 JITTER_CASES = ('jitter-http','jitter-cross-second','jitter-millisecond')
+SCOPE_CASES = ('azure-zero','azure-budget','azure-success',
+               'encrypted-zero','encrypted-budget','encrypted-success',
+               'bad-response-terminal','code-in-message-terminal',
+               'compact-zero','compact-fixed','compact-above-five','compact-success',
+               'compact-azure','compact-encrypted','compact-jitter',
+               'automatic-zero','automatic-budget','automatic-success',
+               'post-turn-budget','post-turn-jitter')
 
 
 def _stage(data, path, settings=None):
@@ -32,24 +39,40 @@ def _case(probe, path, name, settings, expected, success, options, logger):
     result = probe(str(path), 4, stream_retries=5, succeed=success, **options)
     assert not result['timed_out'], f'{name}: timed out'
     assert result['requests'] == expected, f"{name}: {result['requests']} requests, expected {expected}"
-    assert result['exit_code'] == (0 if success else 1), f'{name}: unexpected exit'
+    # Background/post-turn compaction failure does not invalidate the already
+    # completed model answer. Preserve that native distinction.
+    automatic = isinstance(options.get('compact'),str)
+    assert result['exit_code'] == (0 if success or automatic else 1), f'{name}: unexpected exit'
     intervals = result['intervals_seconds']
     assert len(intervals) == expected-1, f'{name}: missing request intervals'
     base, spread = settings['interval_ms'], settings.get('jitter_ms', 0)
-    if spread:
+    compact=options.get('compact',False)
+    if compact:
+        assert result['setup_requests']==1 and result['setup_compaction_requests']==0, f'{name}: invalid setup'
+        assert result['compaction_requests']==expected, f'{name}: not compaction requests'
+        assert result['reconnects']==[f"Reconnecting... {i}/{settings['max_retries']}" for i in range(1,expected)], f'{name}: retry budget notifications differ'
+    if spread and compact:
+        # Local compaction has no selected-Duration log. Check real request
+        # intervals, in addition to execution tests of the shared delay emitter.
+        assert all(max(0,(base-spread)/1000-.04)<=v<=(base+spread)/1000+.5 for v in intervals), f'{name}: interval outside jitter range'
+        assert max(intervals)-min(intervals)>.02, f'{name}: no observed variation'
+    elif spread:
         delays = result['selected_delays_ms']
         assert len(delays) == expected-1 and all(base-spread <= v <= base+spread for v in delays), f'{name}: chosen wait outside range'
         assert len(set(delays)) > 1, f'{name}: no observed variation'
         assert all(max(0,wait/1000-.04) <= actual <= wait/1000+.5
-                   for wait,actual in zip(delays,intervals)), f'{name}: interval mismatch'
+                   for wait,actual in zip(delays,intervals)), f'{name}: interval mismatch: selected={delays}, actual={intervals}'
     elif base:
-        assert all(base/1000-.04 <= t <= base/1000+.5 for t in intervals), f'{name}: interval mismatch'
+        assert all(base/1000-.04 <= t <= base/1000+.5 for t in intervals), f'{name}: interval mismatch: expected={base}ms, actual={intervals}'
     row = dict(name=name, passed=True, retries=settings['max_retries'],
                interval_seconds=f'{base/1000:g}', profile=settings, requests=result['requests'],
                intervals_seconds=intervals, interface=result['interface'], exit_code=result['exit_code'],
                seconds=round(time.perf_counter()-started,3))
-    if spread:
+    if spread and not compact:
         row['selected_delays_ms'] = result['selected_delays_ms']
+    if compact:
+        row.update(compact=compact,reconnects=result['reconnects'],
+                   compaction_requests=result['compaction_requests'],wait_evidence='request_intervals')
     logger.info('Native case passed: %s requests=%s seconds=%s', name, expected, row['seconds'])
     return row
 
@@ -111,7 +134,7 @@ def run_suite(data, owner):
     work.mkdir(parents=True,exist_ok=True)
     jitter_supported = (sha(data) != SUPPORTED_SHA256 and
                         locate(data, ControllerError)['family'] == 'responses-sampling-x64-outlined')
-    report = dict(cases=[], supports_jitter=jitter_supported, max_workers=4)
+    report = dict(cases=[], supports_jitter=jitter_supported, supports_retry_scope=jitter_supported, max_workers=4)
     with tempfile.TemporaryDirectory(dir=work,prefix='native-') as temporary:
         directory = Path(temporary)
         original = _stage(data, directory/'original'/'codex.exe')
@@ -166,6 +189,32 @@ def run_suite(data, owner):
                 case('jitter-http',8,'.1',9,jitter='.07',stop_after=10)
                 case('jitter-cross-second',8,'1',9,jitter='.07',stop_after=10,interface='app-server')
                 case('jitter-millisecond',8,'.005',9,jitter='.004',stop_after=10)
+                from .native_errors import AZURE_RESOURCE_MESSAGE, ENCRYPTED_CONTENT_CODE
+                azure=dict(error_status=400,error_type='invalid_request_error',
+                           error_message=AZURE_RESOURCE_MESSAGE+' [trace_id=local-acceptance]')
+                encrypted=dict(error_status=400,error_type='invalid_request_error',
+                               error_message='bad response status code 400 (request id: local)',
+                               error_code=ENCRYPTED_CONTENT_CODE)
+                for label,error in [('azure',azure),('encrypted',encrypted)]:
+                    case(label+'-zero',0,'.5',1,interface='app-server',**error)
+                    case(label+'-budget',3,'.125',4,interface='app-server',**error)
+                    case(label+'-success',3,'.125',3,success=True,stop_after=2,interface='app-server',**error)
+                case('bad-response-terminal',3,'.125',1,interface='app-server',error_status=400,
+                     error_message='bad response status code 400')
+                case('code-in-message-terminal',3,'.125',1,interface='app-server',error_status=400,
+                     error_message='example: "code":"invalid_encrypted_content"',error_code='invalid_parameter')
+                case('compact-zero',0,'.5',1,interface='app-server',compact=True)
+                case('compact-fixed',3,'.125',4,interface='app-server',compact=True)
+                case('compact-above-five',8,'.1',9,interface='app-server',compact=True,stop_after=10)
+                case('compact-success',3,'.125',3,success=True,stop_after=2,interface='app-server',compact=True)
+                case('compact-azure',3,'.125',4,interface='app-server',compact=True,**azure)
+                case('compact-encrypted',3,'.125',4,interface='app-server',compact=True,**encrypted)
+                case('compact-jitter',8,'.1',9,jitter='.07',stop_after=10,interface='app-server',compact=True)
+                case('automatic-zero',0,'.5',1,interface='app-server',compact='auto')
+                case('automatic-budget',8,'.1',9,stop_after=10,interface='app-server',compact='auto')
+                case('automatic-success',3,'.125',3,success=True,stop_after=2,interface='app-server',compact='auto')
+                case('post-turn-budget',8,'.1',9,stop_after=10,interface='app-server',compact='post-turn')
+                case('post-turn-jitter',8,'.1',9,jitter='.07',stop_after=10,interface='app-server',compact='post-turn')
             for future in as_completed(pending):
                 result = future.result()
                 if future is recovery:
@@ -181,7 +230,7 @@ def run_suite(data, owner):
             assert sha(path.read_bytes()) == digest, 'probe changed its immutable engine'
         report['staged_profiles'] = len(staged)
         report['staging_seconds'] = round(staging_seconds,3)
-    order = REQUIRED_CASES+JITTER_CASES
+    order = REQUIRED_CASES+JITTER_CASES+SCOPE_CASES
     report['cases'].sort(key=lambda row:order.index(row['name']))
     for row in report['cases']:
         if row['name'].endswith('-classification'):

@@ -17,10 +17,12 @@ def cache_path(manager, data):
 
 
 def cached(manager, data):
-    from .native_suite import REQUIRED_CASES, JITTER_CASES
+    from .native_suite import REQUIRED_CASES, JITTER_CASES, SCOPE_CASES
     try:
         report = json.loads(cache_path(manager,data).read_text(encoding='utf-8'))
         required = set(REQUIRED_CASES) | (set(JITTER_CASES) if report.get('supports_jitter') is True else set())
+        if report.get('supports_retry_scope') is True:
+            required.update(SCOPE_CASES)
         if (report.get('format') == 1 and report.get('passed') is True
                 and report.get('recipe_sha256') == recipe_id()
                 and report.get('base_sha256') == sha(data)

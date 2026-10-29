@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -41,6 +42,80 @@ def receipt(resources, target, manifest):
                 official_files=manifest['official_files'], recipe_sha256=manifest['recipe_sha256'],
                 desktop_rules_sha256=manifest['desktop_rules_sha256'],
                 retry=retry_result(manifest['profile']), comparisons=matrices(), scope='fixture')
+
+
+class RetryScopeReceiptTests(unittest.TestCase):
+    def rows(self,p):
+        rows=[]
+        for name in validation.SCOPE_PROBES:
+            result=retry_result(p)
+            result['exit_code']=result['turn_exit_code']
+            if name in ('automatic','post-turn'):
+                result['exit_code']=0
+            result.update(setup_requests=1,setup_compaction_requests=0,
+                          compaction_requests=result['requests'])
+            rows.append(dict(name=name,result=result))
+        return rows
+
+    def test_actual_settings_require_all_paths_and_original_budget(self):
+        for p in (profile(0,'0'),profile(2,'.125'),profile(300,'1.5','.5')):
+            rows=self.rows(p)
+            self.assertTrue(validation.scope_results_valid(rows,p))
+            self.assertFalse(validation.scope_results_valid(rows[:-1],p))
+            rows[2]['result']['requests']+=1
+            self.assertFalse(validation.scope_results_valid(rows,p))
+        p=profile(300,'1.5','.5');rows=self.rows(p)
+        rows[2]['result']['reconnects']=['Reconnecting... 1/5','Reconnecting... 2/5']
+        self.assertFalse(validation.scope_results_valid(rows,p))
+
+    def test_noncompaction_requests_or_out_of_range_waits_do_not_pass(self):
+        p=profile(300,'1.5','.5')
+        rows=self.rows(p);rows[2]['result']['compaction_requests']=0
+        self.assertFalse(validation.scope_results_valid(rows,p))
+        rows=self.rows(p);rows[4]['result']['intervals_seconds']=[.1,.1]
+        self.assertFalse(validation.scope_results_valid(rows,p))
+
+    def test_parameter_probes_overlap_but_keep_complete_ordered_receipts(self):
+        sys.path.insert(0,str(validation.ROOT/'research'))
+        p=profile(300,'1.5','.5')
+        results={row['name']:row['result'] for row in self.rows(p)}
+        barrier=threading.Barrier(4,timeout=5)
+        lock=threading.Lock();active=0;peak=0
+        def probe(*args,**kwargs):
+            nonlocal active,peak
+            mode=kwargs.get('compact')
+            name=({True:'compact','auto':'automatic','post-turn':'post-turn'}[mode] if mode
+                  else 'encrypted' if kwargs.get('error_code') else 'azure')
+            with lock:
+                active+=1;peak=max(peak,active)
+            try:
+                if name!='post-turn':barrier.wait()
+                return results[name]
+            finally:
+                with lock:active-=1
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);target=root/'runtime';target.mkdir()
+            manifest=dict(profile=p,supports_retry_scope=True,runtime_files={'codex.exe':'fixture'},
+                          official_files={},recipe_sha256='fixture',desktop_rules_sha256='fixture')
+            with patch('research.verify_desktop_runtime.replay',return_value=retry_result(p)), \
+                 patch('research.verify_desktop_runtime.sandbox_matrix',return_value=matrices()[0]), \
+                 patch('probe_retries.probe',side_effect=probe):
+                report=validation.run(root,target,manifest)
+            self.assertEqual(peak,4)
+            self.assertEqual([r['name'] for r in report['retry_scope']],list(validation.SCOPE_PROBES))
+            self.assertTrue(validation.receipt_valid(report,dict(manifest,format=3,config_policy='user-managed')))
+
+    def test_parameter_worker_failure_does_not_reach_sandbox_or_approval(self):
+        sys.path.insert(0,str(validation.ROOT/'research'))
+        p=profile(300,'1.5','.5')
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            with patch('research.verify_desktop_runtime.replay',return_value=retry_result(p)), \
+                 patch('research.verify_desktop_runtime.sandbox_matrix') as sandbox, \
+                 patch('probe_retries.probe',side_effect=RuntimeError('probe failed')):
+                with self.assertRaisesRegex(RuntimeError,'probe failed'):
+                    validation.run(root,root,dict(profile=p,supports_retry_scope=True))
+                sandbox.assert_not_called()
 
 
 class RuntimeTests(unittest.TestCase):

@@ -47,6 +47,7 @@ def classifier_flow(prefix, none_value=SENTINEL):
     """
     registers = {'rcx': ('error-pointer',), 'rdx': ('attempt',)}
     sign = None
+    classification = None
 
     def name(i, op):
         if op.type != 1 or op.size not in (4, 8):
@@ -84,6 +85,7 @@ def classifier_flow(prefix, none_value=SENTINEL):
                 raise ValueError('terminal mask is not indexed by normalized error tag')
             if registers.get('rdx') != ('constant', none_value):
                 raise ValueError('terminal result is not None duration')
+            classification = dict(mask=mask[1], default_tag=index[3][1])
             continue
         if i.mnemonic == 'test':
             left, right = read(i, a), read(i, b)
@@ -109,6 +111,7 @@ def classifier_flow(prefix, none_value=SENTINEL):
         elif i.mnemonic not in ('mov', 'movabs'):
             raise ValueError('non-relocatable classifier instruction')
         registers[target] = value
+    return classification
 
 
 def classifier(ins, none_value=SENTINEL):

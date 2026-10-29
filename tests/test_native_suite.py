@@ -49,14 +49,18 @@ class NativeSuiteTests(unittest.TestCase):
                     if fail and count == 0:
                         raise RuntimeError('fixture probe failed')
                     requests = count+1
-                    if options.get('error_code') == 'insufficient_quota' or options.get('error_status') == 400:
+                    from controller.native_errors import AZURE_RESOURCE_MESSAGE
+                    retryable400=(options.get('error_code')=='invalid_encrypted_content' or
+                                  options.get('error_message','').startswith(AZURE_RESOURCE_MESSAGE))
+                    if options.get('error_code') == 'insufficient_quota' or (options.get('error_status') == 400 and not retryable400 and not options.get('compact')):
                         requests = 1
                     if options.get('succeed'):
                         requests = options['stop_after']+1
-                delays = [base-spread+i%(2*spread+1) if spread else base for i in range(requests-1)]
-                return dict(timed_out=False,requests=requests,exit_code=0 if options.get('succeed') else 1,
+                delays = [base-spread+2*spread*(i%2) if spread else base for i in range(requests-1)]
+                return dict(timed_out=False,requests=requests,exit_code=0 if options.get('succeed') or isinstance(options.get('compact'),str) else 1,
                             intervals_seconds=[v/1000 for v in delays],selected_delays_ms=delays,
-                            interface=options.get('interface','exec'))
+                            interface=options.get('interface','exec'),setup_requests=1,setup_compaction_requests=0,
+                            compaction_requests=requests,reconnects=[f'Reconnecting... {i}/{count}' for i in range(1,requests)])
             finally:
                 with lock:
                     active -= 1
@@ -83,9 +87,9 @@ class NativeSuiteTests(unittest.TestCase):
 
     def test_parallel_probes_reuse_profiles_and_keep_complete_restoration(self):
         report, observed = self.execute()
-        self.assertEqual([c['name'] for c in report['cases']],list(suite.REQUIRED_CASES+suite.JITTER_CASES))
-        self.assertEqual(report['staged_profiles'],10)
-        self.assertEqual(len(observed),10)
+        self.assertEqual([c['name'] for c in report['cases']],list(suite.REQUIRED_CASES+suite.JITTER_CASES+suite.SCOPE_CASES))
+        self.assertEqual(report['staged_profiles'],11)
+        self.assertEqual(len(observed),11)
         self.assertEqual(report['restored_sha256'],sha(self.data))
         self.assertTrue(report['interrupted_write_recovery'] and report['unrelated_change_refused'])
 

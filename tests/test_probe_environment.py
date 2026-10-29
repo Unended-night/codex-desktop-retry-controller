@@ -16,7 +16,7 @@ import verify_reported_rate_limit as reported
 class ProbeEnvironmentTests(unittest.TestCase):
     def test_probes_enable_retry_warnings_without_changing_parent_environment(self):
         calls=[]
-        def run(exe,directory,env,timeout):
+        def run(exe,directory,env,timeout,**options):
             self.assertEqual(env['RUST_LOG'],'warn')
             self.assertEqual(env['CODEX_HOME'],directory)
             self.assertTrue((Path(directory)/'config.toml').is_file())

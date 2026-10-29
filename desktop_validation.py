@@ -1,4 +1,5 @@
 """Behavior receipts for staged desktop runtimes; no real model requests."""
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from controller.core import ROOT, ControllerError, sha
@@ -95,6 +96,39 @@ def sandbox_valid(matrices):
             == [c['observations'] for c in matrices[1]['cases']])
 
 
+SCOPE_PROBES = ('azure','encrypted','compact','automatic','post-turn')
+
+
+def scope_results_valid(rows,p):
+    """Actual saved settings must also reach each newly supported retry path."""
+    try:
+        if [r['name'] for r in rows] != list(SCOPE_PROBES):
+            return False
+        attempts=min(p['max_retries'],2)
+        for row in rows:
+            r=row['result'];compact=row['name'] in ('compact','automatic','post-turn')
+            automatic=row['name'] in ('automatic','post-turn')
+            if (r['timed_out'] or r['requests']!=attempts+1
+                    or r['exit_code']!=(0 if automatic or p['max_retries']>2 else 1)
+                    or r['reconnects'] != [f"Reconnecting... {i}/{p['max_retries']}" for i in range(1,attempts+1)]
+                    or len(r['intervals_seconds'])!=attempts):
+                return False
+            if compact:
+                if r['setup_requests']!=1 or r['setup_compaction_requests'] or r['compaction_requests']!=attempts+1:
+                    return False
+                lower=max(0,(p['interval_ms']-p.get('jitter_ms',0))/1000-.06)
+                upper=(p['interval_ms']+p.get('jitter_ms',0))/1000+1.5
+                if not all(lower<=v<=upper for v in r['intervals_seconds']):
+                    return False
+            else:
+                adapted=dict(r,exact_error_seen=True,turn_exit_code=r['exit_code'])
+                if not check_retry(adapted,p):
+                    return False
+        return True
+    except (KeyError,TypeError,ValueError):
+        return False
+
+
 def receipt_valid(report, manifest):
     try:
         version = manifest.get('format')
@@ -111,6 +145,8 @@ def receipt_valid(report, manifest):
                 and report['recipe_sha256'] == manifest['recipe_sha256']
                 and report['desktop_rules_sha256'] == manifest['desktop_rules_sha256']
                 and check_retry(report['retry'], manifest['profile'])
+                and (not manifest.get('supports_retry_scope') or
+                     scope_results_valid(report.get('retry_scope',[]),manifest['profile']))
                 and sandbox_valid(report['comparisons']))
     except (KeyError, TypeError, ValueError, AttributeError):
         return False
@@ -127,6 +163,29 @@ def run(resources, target, manifest):
                    timeout=45 + 2 * (p['interval_ms']+p.get('jitter_ms', 0)) / 1000)
     if not check_retry(retry, p):
         raise ControllerError(f'新参数的重试次数或实际等待时间未通过验收：{retry}')
+    scope=[]
+    if manifest.get('supports_retry_scope'):
+        import sys
+        sys.path.insert(0,str(ROOT/'research'))
+        from probe_retries import probe
+        from controller.native_errors import AZURE_RESOURCE_MESSAGE, ENCRYPTED_CONTENT_CODE
+        options=[dict(error_status=400,error_type='invalid_request_error',error_message=AZURE_RESOURCE_MESSAGE+' [trace_id=local-parameters]'),
+                 dict(error_status=400,error_type='invalid_request_error',error_code=ENCRYPTED_CONTENT_CODE,
+                      error_message='bad response status code 400 (request id: local)'),
+                 dict(compact=True),dict(compact='auto'),dict(compact='post-turn')]
+        def run_probe(item):
+            name,option=item
+            result=probe(str(target/'codex.exe'),4,stream_retries=5,interface='app-server',
+                         succeed=p['max_retries']>2,stop_after=2 if p['max_retries']>2 else 4,
+                         timeout=45+2*(p['interval_ms']+p.get('jitter_ms',0))/1000,**option)
+            return dict(name=name,result=result)
+        # Each probe owns its temporary config/server and only reads the image.
+        # Keep the native suite's concurrency bound and deterministic receipts;
+        # any failed future still prevents publication after workers finish.
+        with ThreadPoolExecutor(max_workers=4,thread_name_prefix='retry-parameters') as pool:
+            scope=list(pool.map(run_probe,zip(SCOPE_PROBES,options)))
+        if not scope_results_valid(scope,p):
+            raise ControllerError('新参数的两类错误或压缩重试验收失败，未切换入口。')
     matrices = [sandbox_matrix(resources / 'codex.exe', work, 'official', registered=True),
                 sandbox_matrix(target / 'codex.exe', work, 'copy', registered=False)]
     if not sandbox_valid(matrices):
@@ -135,5 +194,5 @@ def run(resources, target, manifest):
                 engine_sha256=manifest['runtime_files']['codex.exe'],
                 official_files=manifest['official_files'],
                 recipe_sha256=manifest['recipe_sha256'], desktop_rules_sha256=manifest['desktop_rules_sha256'],
-                retry=retry, comparisons=matrices,
+                retry=retry, retry_scope=scope, comparisons=matrices,
                 scope='Isolated app-server SSE and unelevated command/exec. No elevated/service or firewall equivalence claim.')

@@ -59,7 +59,9 @@ def build_plan(data: bytes, p: dict) -> list[dict]:
         result=[]
         for off,size,new,label in replacements(data,p,ControllerError):
             if len(new)>size: raise ControllerError('补丁空间不足。')
-            result.append(dict(offset=off,before=b64(data[off:off+size]),
+            if off > len(data) or (off < len(data) < off+size):
+                raise ControllerError('补丁追加范围不合法。')
+            result.append(dict(offset=off,before=b64(data[off:off+size].ljust(size,b'\0')),
                                after=b64(new.ljust(size,b'\x90')),label=label))
         return sorted(result,key=lambda x:x['offset'])
     if p.get('jitter_ms', 0):
@@ -144,6 +146,8 @@ def patched_bytes(original: bytes, slots: list[dict]) -> bytes:
     output = bytearray(original)
     for item in slots:
         offset, before, after = item["offset"], unb64(item["before"]), unb64(item["after"])
+        if offset == len(output) and before == bytes(len(before)):
+            output.extend(before)
         if len(before) != len(after) or output[offset:offset + len(before)] != before:
             raise ControllerError("原始字节与补丁不匹配。")
         output[offset:offset + len(before)] = after
@@ -162,14 +166,21 @@ def transition_slots(baseline: bytes, target: bytes, new_slots: list[dict], old_
             merged[-1][1] = max(merged[-1][1], end)
         else:
             merged.append([start, end])
-    return [dict(offset=a, before=b64(baseline[a:z]), after=b64(target[a:z]),
+    return [dict(offset=a, before=b64(baseline[a:z].ljust(z-a,b'\0')), after=b64(target[a:z]),
                  label="current and previous recipe") for a, z in merged]
 
 
 def recover_baseline(data: bytes, journal: dict) -> bytes:
     try:
-        if journal["format"] != 1 or len(data) != journal["size"]:
+        extended = journal["format"] == 2
+        base_size = journal["base_size"] if extended else journal["size"]
+        if (journal["format"] not in (1,2) or type(base_size) is not int
+                or not 0 < base_size <= journal["size"]
+                or not base_size <= len(data) <= journal["size"]):
             raise ValueError("format or size")
+        if not extended and len(data) != journal["size"]:
+            raise ValueError("size")
+        data = data.ljust(journal["size"], b'\0')
         output = bytearray(data)
         previous_end = -1
         for item in journal["slots"]:
@@ -186,9 +197,10 @@ def recover_baseline(data: bytes, journal: dict) -> bytes:
                 raise ValueError("unexpected modified bytes")
             output[offset:offset + len(old)] = old
             previous_end = offset + len(old)
-        if sha(output) != journal["base_sha256"]:
+        original = memoryview(output)[:base_size]
+        if any(output[base_size:]) or sha(original) != journal["base_sha256"]:
             raise ValueError("baseline hash")
-        return bytes(output)
+        return bytes(original)
     except (KeyError, TypeError, ValueError) as exc:
         raise ControllerError("程序与撤销记录不一致：可能已更新或被其他工具修改。拒绝覆盖。") from exc
 
@@ -387,15 +399,21 @@ class Manager:
                 else:
                     slots = build_plan(baseline, p)
                     target = patched_bytes(baseline, slots)
+                    size = max(len(target), old_journal['size'] if old_journal else len(baseline))
+                    target = target.ljust(size, b'\0')
                     slots = transition_slots(baseline, target, slots, old_journal)
-                    journal = {"format": 1, "path": str(path), "version": version_of(baseline),
-                               "size": len(baseline), "base_sha256": sha(baseline),
+                    journal = {"format": 2 if size != len(baseline) else 1,
+                               "path": str(path), "version": version_of(baseline),
+                               "size": size, "base_sha256": sha(baseline),
                                "patched_sha256": sha(target), "profile": p, "slots": slots}
+                    if size != len(baseline):
+                        journal['base_size'] = len(baseline)
                 if current == target:
                     return {"action": action, "changed": False, "sha256": sha(target), "profile": p, "version": actual_version}
                 for item in slots:
                     off = item["offset"]
-                    item["previous"] = b64(current[off:off + len(unb64(item["before"]))])
+                    length = len(unb64(item['before']))
+                    item["previous"] = b64(current[off:off + length].ljust(length,b'\0'))
                 journal.update(phase="prepared", operation=action, updated_at=now())
                 atomic_json(self.journal_path(path), journal)  # Must precede binary writes.
                 try:
@@ -405,6 +423,7 @@ class Manager:
                         stream.seek(off)
                         if stream.write(value) != len(value):
                             raise OSError("short write")
+                    stream.truncate(len(target))
                     stream.flush()
                     os.fsync(stream.fileno())
                     stream.seek(0)
@@ -415,6 +434,7 @@ class Manager:
                     for item in slots:
                         stream.seek(item["offset"])
                         stream.write(unb64(item["before"]))
+                    stream.truncate(len(baseline))
                     stream.flush()
                     os.fsync(stream.fileno())
                     self.logger.exception("write failed; attempted rollback to clean baseline")

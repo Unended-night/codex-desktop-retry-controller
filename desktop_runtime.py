@@ -121,6 +121,7 @@ def publish(root, p, config, resources_getter=launcher.installed_resources):
         finally:
             patcher.close()
         manifest = dict(before, format=3, config_policy='user-managed',
+                        supports_retry_scope=approval.get('supports_retry_scope',False),
                         created_at=now(), version=approval['version'], profile=p,
                         desktop_exe=str(resources.parent / 'ChatGPT.exe'), activation='not-approved',
                         runtime_files={n: launcher.digest(target / n) for n in validation.COMPONENTS})

@@ -6,7 +6,7 @@ import threading
 import time
 
 
-def run(exe, directory, env, timeout):
+def run(exe, directory, env, timeout, *, compact=False):
     proc = subprocess.Popen([exe, "app-server", "--stdio"], cwd=directory, env=env,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW)
@@ -33,6 +33,7 @@ def run(exe, directory, env, timeout):
 
     timed_out = False
     turn = None
+    compact_started = False
     try:
         send({"id":1, "method":"initialize", "params":{"clientInfo":{"name":"retry_probe", "version":"1.0"},
               "capabilities":{"experimentalApi":True}}})
@@ -56,6 +57,10 @@ def run(exe, directory, env, timeout):
                       "input":[{"type":"text", "text":"Reply OK."}]}})
             elif message.get("method") == "turn/completed":
                 turn = message["params"]["turn"]
+                if compact and not isinstance(compact,str) and not compact_started and turn.get("status") == "completed":
+                    compact_started = True
+                    send({"id":4, "method":"thread/compact/start", "params":{"threadId":thread_id}})
+                    continue
                 break
         else:
             timed_out = True

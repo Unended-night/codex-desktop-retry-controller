@@ -193,9 +193,18 @@ def _locate(data, error):
                     for name,pat in families.items() for m in re.finditer(pat,data,re.S)]
         if not candidates:
             from .native_v4 import locate_outlined
-            return locate_outlined(data, function, off, va, refs, cs,
+            result = locate_outlined(data, function, off, va, refs, cs,
                 has_reference=has_reference,
                 reference_candidates=lambda target: _relative_reference_candidates(data, regions, target))
+            from .native_errors import locate_invalid_request
+            from .native_compact import locate_compaction
+            from .native_extension import layout
+            executable_regions = [(s.PointerToRawData, s.PointerToRawData+s.Misc_VirtualSize,
+                                   base+s.VirtualAddress) for s in pe.sections if s.Characteristics & 0x20000000]
+            result['invalid_request'] = locate_invalid_request(data,result,function,off,va,cs,executable_regions)
+            result['compact'] = locate_compaction(data,result,function,off,va)
+            result['extension'] = layout(data,pe)
+            return result
         if len(candidates)!=1:
             raise ValueError(f'model error classifier: expected one pattern, found {len(candidates)}')
         family,classify=candidates[0]
@@ -266,8 +275,21 @@ def _locate(data, error):
 def replacements(data,p,error):
     s=locate(data,error)
     if s['family']=='responses-sampling-x64-outlined':
-        from .native_v4 import replacements as outlined_replacements
-        return outlined_replacements(s,p)
+        from .native_v4 import replacements as outlined_replacements, delay_code, jmp
+        patches = outlined_replacements(s,p)
+        from .native_errors import error_policy
+        from .native_extension import section_patches
+        code = error_policy(s,p)
+        code = code.ljust((len(code)+15)&~15,b'\xcc')
+        compact_entry = s['extension']['base']+s['extension']['rva']+len(code)
+        code += delay_code(p)+b'\xc3'
+        entry=s['extension']['base']+s['extension']['rva']
+        patches=[patch for patch in patches if patch[3]!='model_outer_policy']
+        patches += [(s['offsets']['call'],5,jmp(s['call'],entry,b'\xe8'),'model_outer_policy')]
+        for n,site in enumerate(s['compact']):
+            patches += [(site['call_offset'],5,jmp(site['call'],compact_entry,b'\xe8'),f'compact_delay_{n}'),
+                        (site['init'],site['init_size'],b'\xb8'+struct.pack('<I',p['max_retries']),f'compact_budget_{n}')]
+        return patches+section_patches(s['extension'],code)
     if p.get('jitter_ms', 0):
         raise error('此旧版重试结构尚未支持随机扰动，可使用固定等待。')
     policy=s['policy_prefix']+struct.pack('<I',s['budget'])+struct.pack('<I',p['max_retries'])

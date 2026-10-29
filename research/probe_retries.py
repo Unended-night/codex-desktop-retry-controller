@@ -23,31 +23,42 @@ def retry_delays(stderr):
             re.findall(r'retrying sampling request \(\d+/\d+ in ([0-9.]+)(ms|µs|ns|s)\)', stderr)]
 
 
-def probe(exe, retries, *, stream_retries=0, mode="http", debug_patches=None, retry_after=None, stop_after=7, error_status=500, succeed=False, timeout=45, error_code=None, interface="exec"):
+def probe(exe, retries, *, stream_retries=0, mode="http", debug_patches=None, retry_after=None, stop_after=7, error_status=500, succeed=False, timeout=45, error_code=None, interface="exec", error_message="local retry probe", error_type="server_error", compact=False):
+    if compact and interface != "app-server":
+        raise ValueError("compaction probes require app-server")
     events = []
+    setup_events = []
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
 
         def do_POST(self):
-            self.rfile.read(int(self.headers.get("Content-Length", "0")))
-            success = len(events) >= stop_after and succeed
-            status = (200 if mode in ("stream", "stream-rate-limit") else error_status) if len(events) < stop_after else (200 if success else 401)
-            events.append({"time": time.monotonic(), "path": self.path, "status": status})
+            request=self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            setup = compact and not setup_events
+            is_compaction = b'CONTEXT CHECKPOINT COMPACTION' in request
+            continuation = compact and not setup and not is_compaction
+            success = setup or continuation or (len(events) >= stop_after and succeed)
+            status = 200 if success else ((200 if mode in ("stream", "stream-rate-limit", "stream-error") else error_status) if len(events) < stop_after else 401)
+            if not continuation:
+                (setup_events if setup else events).append({"time": time.monotonic(), "path": self.path, "status": status,
+                                                            "compaction":is_compaction})
             if mode == "disconnect":
                 self.close_connection = True
                 return
             payload = (b'data: {"type":"response.created","response":{"id":"probe","status":"in_progress","output":[]}}\n\n'
-                       if status == 200 else json.dumps({"error": {"message": "local retry probe", "type": "server_error", "code":error_code}}).encode())
+                       if status == 200 else json.dumps({"error": {"message": error_message, "type": error_type, "code":error_code}}).encode())
             if mode == "stream-rate-limit" and not success:
                 payload += b'data: {"type":"response.failed","response":{"id":"probe","error":{"code":"rate_limit_exceeded","message":"Rate limit reached. Please try again in 4s."}}}\n\n'
+            if mode == "stream-error" and not success:
+                payload += ("data: " + json.dumps({"type":"response.failed", "response":{"id":"probe", "error":{"code":error_code,"type":error_type,"message":error_message}}}) + "\n\n").encode()
             if success:
                 item = {"id":"msg_probe", "type":"message", "role":"assistant", "status":"completed",
                         "content":[{"type":"output_text", "text":"OK", "annotations":[]}]}
+                usage = (150000 if compact=='auto' else 600000) if setup and isinstance(compact,str) else 1
                 for event in [{"type":"response.output_item.done", "output_index":0, "item":item},
                               {"type":"response.completed", "response":{"id":"probe", "status":"completed", "output":[item],
-                               "usage":{"input_tokens":1, "output_tokens":1, "total_tokens":2}}}]:
+                               "usage":{"input_tokens":usage, "output_tokens":1, "total_tokens":usage+1}}}]:
                     payload += ("data: " + json.dumps(event) + "\n\n").encode()
             self.send_response(status)
             self.send_header("Content-Type", "text/event-stream" if status == 200 else "application/json")
@@ -65,6 +76,9 @@ def probe(exe, retries, *, stream_retries=0, mode="http", debug_patches=None, re
             root = Path(directory)
             (root / "config.toml").write_text(
                 'model = "retry-probe-model"\nmodel_provider = "probe"\n'
+                + ('model_context_window = 1000000\nmodel_auto_compact_token_limit = 100000\n'
+                   f'model_post_turn_compact_threshold_percent = {50 if compact=="post-turn" else 100}\n'
+                   if isinstance(compact,str) else '') +
                 '[features]\nplugins = false\n'
                 '[model_providers.probe]\nname = "loopback probe"\n'
                 f'base_url = "http://127.0.0.1:{server.server_port}/v1"\n'
@@ -82,7 +96,7 @@ def probe(exe, retries, *, stream_retries=0, mode="http", debug_patches=None, re
             debug_hits = []
             if interface == "app-server":
                 from appserver_probe import run
-                stdout, stderr, exit_code, timed_out = run(exe, directory, env, timeout)
+                stdout, stderr, exit_code, timed_out = run(exe, directory, env, timeout, compact=compact)
             else:
                 proc = subprocess.Popen(args, cwd=directory, env=env, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
@@ -106,7 +120,11 @@ def probe(exe, retries, *, stream_retries=0, mode="http", debug_patches=None, re
                     for a, b in zip(events, events[1:])],
                     "statuses": [e["status"] for e in events],
                     "paths": sorted(set(e["path"] for e in events)),
-                    "interface": interface, "exit_code": exit_code, "timed_out": timed_out,
+                    "interface": interface, "compact": compact, "setup_requests": len(setup_events),
+                    "setup_compaction_requests":sum(e['compaction'] for e in setup_events),
+                    "compaction_requests":sum(e['compaction'] for e in events),
+                    "reconnects": re.findall(r'Reconnecting\.\.\. \d+/\d+', stdout),
+                    "exit_code": exit_code, "timed_out": timed_out,
                     "duration_seconds": round(time.monotonic() - start, 3),
                     "selected_delays_ms": retry_delays(stderr),
                     "stdout_tail": stdout[-2000:], "stderr_tail": stderr[-2000:]}

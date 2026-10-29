@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 from controller.core import Manager, ControllerError, atomic_json, b64, sha, version_of
 from controller.verification import cached, cache_path
-from controller.native_suite import REQUIRED_CASES, JITTER_CASES
+from controller.native_suite import REQUIRED_CASES, JITTER_CASES, SCOPE_CASES
 
 
 class Compatibility(unittest.TestCase):
@@ -135,6 +135,13 @@ class Compatibility(unittest.TestCase):
                     record['cases'][-1]['passed']=False
                     atomic_json(cache_path(manager,data),record)
                     self.assertIsNone(cached(manager,data))
+                    record['cases'][-1]['passed']=True
+                    record['supports_retry_scope']=True
+                    atomic_json(cache_path(manager,data),record)
+                    self.assertIsNone(cached(manager,data))
+                    record['cases'] += [dict(name=n,passed=True) for n in SCOPE_CASES]
+                    atomic_json(cache_path(manager,data),record)
+                    self.assertIsNotNone(cached(manager,data))
             finally:
                 manager.close()
 
