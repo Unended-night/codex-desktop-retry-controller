@@ -202,7 +202,8 @@ def _locate(data, error):
             executable_regions = [(s.PointerToRawData, s.PointerToRawData+s.Misc_VirtualSize,
                                    base+s.VirtualAddress) for s in pe.sections if s.Characteristics & 0x20000000]
             result['invalid_request'] = locate_invalid_request(data,result,function,off,va,cs,executable_regions)
-            result['compact'] = locate_compaction(data,result,function,off,va)
+            result['compact'] = locate_compaction(data,result,function,off,va,
+                reference_candidates=lambda target: _relative_reference_candidates(data, regions, target))
             result['extension'] = layout(data,pe)
             return result
         if len(candidates)!=1:
@@ -286,9 +287,16 @@ def replacements(data,p,error):
         entry=s['extension']['base']+s['extension']['rva']
         if 'sampling_sites' in s:
             for n,site in enumerate(s['sampling_sites']):
+                if 'returned_classifier' in site:
+                    policy_entry=entry+len(code)
+                    code+=error_policy(dict(s,**site),p)
+                    policy_patch=(site['offsets']['policy'],site['policy_size'],
+                                  jmp(site['policy'],policy_entry,b'\xe8'),f'model_outer_policy_{n}')
+                else:
+                    policy_patch=(site['offsets']['call'],5,jmp(site['call'],entry,b'\xe8'),f'model_outer_policy_{n}')
                 budget_entry=entry+len(code)
                 code+=imported_budget_code(site,p,budget_entry)
-                patches += [(site['offsets']['call'],5,jmp(site['call'],entry,b'\xe8'),f'model_outer_policy_{n}'),
+                patches += [policy_patch,
                             (site['offsets']['connection'],site['connection_end']-site['connection'],
                              jmp(site['connection'],budget_entry),f'model_outer_budget_{n}'),
                             (site['offsets']['deadline'],site['deadline_size'],
@@ -299,8 +307,14 @@ def replacements(data,p,error):
             patches=[patch for patch in patches if patch[3]!='model_outer_policy']
             patches += [(s['offsets']['call'],5,jmp(s['call'],entry,b'\xe8'),'model_outer_policy')]
         for n,site in enumerate(s['compact']):
-            patches += [(site['call_offset'],5,jmp(site['call'],compact_entry,b'\xe8'),f'compact_delay_{n}'),
-                        (site['init'],site['init_size'],b'\xb8'+struct.pack('<I',p['max_retries']),f'compact_budget_{n}')]
+            if 'returned_classifier' in site:
+                policy_entry=entry+len(code)
+                code+=error_policy(dict(s,**site),p)
+                patches += [(site['policy_offset'],site['policy_size'],jmp(site['policy'],policy_entry,b'\xe8'),f'compact_delay_{n}'),
+                            (site['deadline'],site['deadline_size'],b'\xba'+struct.pack('<I',site['none_value']),f'compact_deadline_{n}')]
+            else:
+                patches.append((site['call_offset'],5,jmp(site['call'],compact_entry,b'\xe8'),f'compact_delay_{n}'))
+            patches.append((site['init'],site['init_size'],b'\xb8'+struct.pack('<I',p['max_retries']),f'compact_budget_{n}'))
         return patches+section_patches(s['extension'],code)
     if p.get('jitter_ms', 0):
         raise error('此旧版重试结构尚未支持随机扰动，可使用固定等待。')

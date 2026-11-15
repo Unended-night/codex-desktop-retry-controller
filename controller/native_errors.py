@@ -193,7 +193,7 @@ def name_references(data, regions, targets):
 
 def locate_invalid_request(data, s, function, off, va, cs, regions):
     prefix=list(cs.disasm(s['prefix'],0))
-    classification=classifier_flow(prefix,s['none_value'])
+    classification=s.get('returned_classifier') or classifier_flow(prefix,s['none_value'])
     if any('rcx' in [i.reg_name(r) for r in i.regs_access()[1]] for i in prefix):
         raise ValueError('retry classifier no longer preserves error pointer')
     results=[]
@@ -207,7 +207,11 @@ def locate_invalid_request(data, s, function, off, va, cs, regions):
                 _,ins=function(at)
                 n=next(n for n,i in enumerate(ins) if i.address==va(at)
                        and i.mnemonic=='lea' and i.reg_name(i.operands[0].reg)=='rdx')
-                result=invalid_request_layout(ins,n,data,off,function,classification)
+                if 'returned_classifier' in s:
+                    from .native_return import invalid_request_layout as byte_layout
+                    result=byte_layout(ins,n,data,off,cs,classification)
+                else:
+                    result=invalid_request_layout(ins,n,data,off,function,classification)
             except (ValueError,KeyError,IndexError,StopIteration,struct.error):
                 continue
             if result not in results:
@@ -222,10 +226,23 @@ def error_policy(s, p):
     Every byte comparison is bounded by the native String's end pointer.
     """
     c=Code()
-    c.emit(s['prefix'])
-    c.relative('0f83','delay')  # Native nonterminal result.
-    c.emit('48b8');c.emit(struct.pack('<Q',s['invalid_request']['tag']))
-    c.emit('483901');c.relative('0f85','return')
+    returned = 'returned_classifier' in s
+    if returned:
+        c.emit('81fa');c.emit(struct.pack('<I',s['none_value']))
+        c.relative('0f85','delay')
+        c.emit(s['error_reload'])
+        # These native arms return None solely when a server deadline is
+        # absent. Our configured delay supplies it; retain all other decisions.
+        for tag in s['returned_classifier']['deadline_only_tags']:
+            c.emit('80b9');c.emit(struct.pack('<iB',s['invalid_request']['tag_offset'],tag))
+            c.relative('0f84','delay')
+        c.emit('80b9');c.emit(struct.pack('<iB',s['invalid_request']['tag_offset'],s['invalid_request']['tag']))
+        c.relative('0f85','return')
+    else:
+        c.emit(s['prefix'])
+        c.relative('0f83','delay')  # Native nonterminal result.
+        c.emit('48b8');c.emit(struct.pack('<Q',s['invalid_request']['tag']))
+        c.emit('483901');c.relative('0f85','return')
     for index,key in enumerate((b'"code"',b'"message"')):
         name=f'field{index}'
         next_field=f'field{index+1}' if index==0 else 'return'
@@ -285,6 +302,7 @@ def error_policy(s, p):
             c.emit('41803820');c.relative('0f85',name+'advance')
         c.relative('e9','delay')
         c.label(name+'advance');c.emit('49ffc2');c.relative('e9',name+'scan')
-    c.label('return');c.emit('c3')
-    c.label('delay');c.emit(delay_code(p));c.emit('c3')
+    compare = b'\x81\xfa'+struct.pack('<I',s['none_value']) if returned else b''
+    c.label('return');c.emit(compare);c.emit('c3')
+    c.label('delay');c.emit(delay_code(p));c.emit(compare);c.emit('c3')
     return c.finish()

@@ -12,6 +12,7 @@ class ErrorPolicyTests(unittest.TestCase):
         script=r'''
 import ctypes as c
 import json
+import struct
 from controller.native_errors import error_policy,AZURE_RESOURCE_MESSAGE as AZURE
 from controller.core import profile
 k=c.WinDLL('kernel32',use_last_error=True)
@@ -34,6 +35,18 @@ def compile(terminal):
     wrapper=bytes.fromhex('4883ec28e80c00000048c1e0204809d04883c428c3')
     return c.CFUNCTYPE(c.c_ulonglong,c.c_void_p)(allocate(wrapper+body))
 terminal=compile(True);native_retry=compile(False)
+def compile_returned(nanos):
+    body=error_policy(dict(returned_classifier={'deadline_only_tags':[37]},none_value=0xffffffff,
+                          error_reload=bytes.fromhex('4889c9'),
+                          invalid_request=dict(tag=99,tag_offset=0,pointer=16,length=24)),profile(3,'.125'))
+    # Return the helper's ZF in bit 32 and EDX in bits 0..31. The patched
+    # caller retains its JE/JNE, so a correct Duration with stale flags fails.
+    after=bytes.fromhex('0f94c10fb6c948c1e12089d04809c84883c428c3')
+    wrapper=bytes.fromhex('4883ec28ba')+struct.pack('<I',nanos)
+    wrapper+=b'\xe8'+struct.pack('<i',len(after))+after
+    return c.CFUNCTYPE(c.c_ulonglong,c.c_void_p)(allocate(wrapper+body))
+returned=compile_returned(0xffffffff)
+returned_retry=compile_returned(1234)
 def record(message='',code=None):
     return json.dumps({'error':{'message':message,'code':code}}).encode()
 positive=[record(AZURE),record(AZURE+' [trace_id=local]'),record('bad response status code 400','invalid_encrypted_content'),
@@ -63,14 +76,19 @@ def invoke(raw,tag=99):
     error=(c.c_ulonglong*4)(tag,len(raw),start,len(raw))
     return terminal(c.addressof(error))&0xffffffff
 try:
-    for raw in positive:assert invoke(raw)==125000000,raw
-    for raw in negative:assert invoke(raw)==0xffffffff,raw
-    for raw in positive:
-        for end in range(len(raw)+1):invoke(raw[:end])
+    for terminal in (terminal,returned):
+        for raw in positive:assert invoke(raw)==125000000,raw
+        for raw in negative:assert invoke(raw)==0xffffffff,raw
+        for raw in positive:
+            for end in range(len(raw)+1):invoke(raw[:end])
     # Non-target variants must not dereference bogus String fields.
     invalid=(c.c_ulonglong*4)(100,0,1,0xffffffffffffffff)
     assert terminal(c.addressof(invalid))&0xffffffff==0xffffffff
     assert native_retry(c.addressof(invalid))&0xffffffff==125000000
+    assert returned(c.addressof(invalid))==0x1ffffffff  # None and ZF=1.
+    assert returned_retry(c.addressof(invalid))==125000000  # Some and ZF=0.
+    invalid[0]=37
+    assert returned(c.addressof(invalid))==125000000  # Deadline-only native arm.
 finally:
     for address in buffers:assert k.VirtualFree(address,0,0x8000)
 print('classifier guard-page checks passed')

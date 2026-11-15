@@ -28,6 +28,7 @@
 /tests/fixtures/*
 !/tests/fixtures/outlined-retry.json
 !/tests/fixtures/retry-scope.json
+!/tests/fixtures/returned-retry.json
 
 !/research/
 /research/*

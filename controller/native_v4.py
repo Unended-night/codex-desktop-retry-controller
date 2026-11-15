@@ -237,10 +237,14 @@ def outer(ins, call_index, helper, data, off):
     import capstone
     decoder = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     decoder.detail = True
-    prefix = list(decoder.disasm(helper, 0))
-    if not prefix or sum(i.size for i in prefix) != len(helper) or prefix[-1].mnemonic != 'bt':
-        raise ValueError('incomplete classifier prefix')
-    classifier_flow(prefix, none_value)
+    returned = isinstance(helper, dict)
+    if returned and helper['none_value'] != none_value:
+        raise ValueError('returned classifier None disagrees with sampling caller')
+    if not returned:
+        prefix = list(decoder.disasm(helper, 0))
+        if not prefix or sum(i.size for i in prefix) != len(helper) or prefix[-1].mnemonic != 'bt':
+            raise ValueError('incomplete classifier prefix')
+        classifier_flow(prefix, none_value)
     addresses={i.address:k for k,i in enumerate(ins)}
     resume=addresses[present]
     reload=ins[resume]
@@ -280,19 +284,28 @@ def outer(ins, call_index, helper, data, off):
     counts=[]
     for k in range(connection_index+1,len(ins)-15):
         a,b=ins[k:k+2]
+        budget_state=resumed
+        bounded_index=k
+        if returned and a.mnemonic=='mov' and mem(a.operands[1]) and a.operands[1].mem.base!=resumed:
+            prior=ins[k-1]
+            budget_state=a.operands[1].mem.base
+            if not (prior.mnemonic=='mov' and reg(prior.operands[0],budget_state)
+                    and prior.operands[0].size==8 and mem(prior.operands[1],x.X86_REG_RBP,slot)):
+                continue
+            bounded_index=k-1
         compare_index=k+2
         if ins[compare_index].mnemonic=='lea':
             compare_index+=1
         c,d,e=ins[compare_index:compare_index+3]
-        if (a.mnemonic=='mov' and reg(a.operands[0],x.X86_REG_RAX) and mem(a.operands[1],resumed)
+        if (a.mnemonic=='mov' and reg(a.operands[0],x.X86_REG_RAX) and mem(a.operands[1],budget_state)
                 and b.mnemonic=='mov' and reg(b.operands[0],x.X86_REG_RCX) and mem(b.operands[1],x.X86_REG_RAX,0)
-                and c.mnemonic=='cmp' and reg(c.operands[0],x.X86_REG_RCX) and mem(c.operands[1],resumed)
+                and c.mnemonic=='cmp' and reg(c.operands[0],x.X86_REG_RCX) and mem(c.operands[1],budget_state)
                 and d.mnemonic=='jae' and d.operands[0].type==2
-                and e.mnemonic=='mov' and mem(e.operands[1],resumed,next_attempt)
-                and (compare_index==k+2 or field_address(ins[k+2],resumed,c.operands[1].mem.disp))):
-            counts.append((k,compare_index))
-    k,compare_index=only(counts,'bounded budget')
-    bounded=ins[k]
+                and e.mnemonic=='mov' and mem(e.operands[1],budget_state,next_attempt)
+                and (compare_index==k+2 or field_address(ins[k+2],budget_state,c.operands[1].mem.disp))):
+            counts.append((k,compare_index,bounded_index,budget_state))
+    k,compare_index,bounded_index,budget_state=only(counts,'bounded budget')
+    bounded=ins[bounded_index]
     budget=ins[compare_index].operands[1].mem.disp
     next_load=ins[compare_index+2]
     write_index=compare_index+3
@@ -303,7 +316,7 @@ def outer(ins, call_index, helper, data, off):
         raise ValueError('attempt counter write disagrees')
     tail=ins[write_index:write_index+13]
     for field in [budget,connection.operands[1].mem.disp,ssec.operands[0].mem.disp,snano.operands[0].mem.disp]:
-        if not any(i.mnemonic=='mov' and mem(i.operands[1],resumed,field) for i in tail):
+        if not any(i.mnemonic=='mov' and mem(i.operands[1],budget_state,field) for i in tail):
             raise ValueError('bounded path fields disagree')
     # Override the source of the unique state initialization, preserving the
     # existing store and register width. No extra stack or nonvolatile writes.
@@ -315,8 +328,12 @@ def outer(ins, call_index, helper, data, off):
                     initial.append(source)
     if len(initial)>1:
         raise ValueError('ambiguous budget initialization')
-    init=initial[0] if initial else None
-    if (init is not None and init.size<5) or lnano.size<5 or call.size!=5:
+    init=initial[0] if initial and not returned else None
+    deadline=lsec if returned else lnano
+    deadline_end=lnano.address+lnano.size
+    if returned and lsec.address+lsec.size!=lnano.address:
+        raise ValueError('returned deadline loads are not adjacent')
+    if (init is not None and init.size<5) or deadline_end-deadline.address<5 or call.size!=5:
         raise ValueError('insufficient instruction space')
     if not 100 <= bounded.address-connection.address <= 1024:
         raise ValueError('unexpected connection block size')
@@ -367,7 +384,7 @@ def outer(ins, call_index, helper, data, off):
             raise ValueError('insufficient imported budget redirect space')
         connection_end=connection.address+connection.size
     ranges=[(call.address,call.address+call.size),
-            (lnano.address,lnano.address+lnano.size),(connection.address,connection_end)]
+            (deadline.address,deadline_end),(connection.address,connection_end)]
     if init is not None:
         ranges.append((init.address,init.address+init.size))
     else:
@@ -393,7 +410,7 @@ def outer(ins, call_index, helper, data, off):
                     and mem(error_reload.operands[1],x.X86_REG_RBP,source.operands[1].mem.disp)
                     and error_reload.operands[1].size==8):
                 raise ValueError('imported budget error reload disagrees with classifier argument')
-        fields=[(budget,8),(next_attempt,8),(bounded.operands[1].mem.disp,8),
+        fields=[(budget,8),(next_attempt,8),(ins[k].operands[1].mem.disp,8),
                 (connection.operands[1].mem.disp,8),
                 (ssec.operands[0].mem.disp,8),(snano.operands[0].mem.disp,4),
                 (lsec.operands[1].mem.disp,8),(lnano.operands[1].mem.disp,4),
@@ -402,20 +419,33 @@ def outer(ins, call_index, helper, data, off):
             raise ValueError('overlapping sampling state fields')
         if ins[compare_index].operands[1].size!=8:
             raise ValueError('sampling budget is not a full counter')
-        if reload.reg_name(resumed) not in ('rbx','rsi','rdi','r12','r13','r14','r15'):
+        allowed=('rbx','rsi','rdi','r12','r13','r14','r15')+ (('r8','r9','r10','r11') if returned else ())
+        if reload.reg_name(resumed) not in allowed:
             raise ValueError('sampling state must survive the policy call')
     safe_ranges(ins,ranges,data,off)
     result=dict(call=call.address,continuation=call.address+call.size,
-                deadline=lnano.address,deadline_size=lnano.size,
+                deadline=deadline.address,deadline_size=deadline_end-deadline.address,
                 connection=connection.address,connection_end=connection_end,
                 bounded=bounded.address,bounded_reload=bounded_reload,
-                prefix=helper,none_value=none_value)
+                prefix=b'' if returned else helper,none_value=none_value)
     if init is not None:
         result.update(init=init.address,init_size=init.size)
     else:
         result.update(budget_field=budget,state_register=reload.reg_name(resumed),
                       reporter=setup[first_call].operands[0].imm,
                       helper=call.operands[0].imm)
+    if returned:
+        policy = ins[call_index+1]
+        while policy.mnemonic == 'nop':
+            policy = ins[addresses[policy.address]+1]
+        argument = ins[call_index-1]
+        if not (policy.size >= 5 and argument.mnemonic == 'mov'
+                and reg(argument.operands[0], x.X86_REG_RCX)
+                and mem(argument.operands[1], x.X86_REG_RBP) and argument.operands[1].size == 8):
+            raise ValueError('returned policy needs a proven error reload and compare space')
+        safe_ranges(ins, [(policy.address, policy.address+policy.size)], data, off)
+        result.update(returned_classifier=helper, policy=policy.address, policy_size=policy.size,
+                      error_reload=bytes(argument.bytes))
     return result
 
 
@@ -741,7 +771,12 @@ def locate_outlined(data, function, off, va, refs, cs, *, has_reference=None, re
             target=ins[n].operands[0].imm
             bounds,helper=function(off(target))
             if target!=bounds[0]: continue
-            candidates.append(outer(ins,n,classifier(helper,none_value),data,off))
+            try:
+                policy = classifier(helper,none_value)
+            except ValueError:
+                from .native_return import returned_classifier
+                policy = returned_classifier(helper,none_value,data,off)
+            candidates.append(outer(ins,n,policy,data,off))
         except (ValueError,KeyError,IndexError,StopIteration):
             continue
     initialized=[s for s in candidates if 'init' in s]
@@ -789,7 +824,7 @@ def locate_outlined(data, function, off, va, refs, cs, *, has_reference=None, re
     result.update(result['http_sites'][0])
     result['family']='responses-sampling-x64-outlined'
     for site in result.get('sampling_sites',[result]):
-        site['offsets']={k:off(site[k]) for k in ('call','init','deadline','connection') if k in site}
+        site['offsets']={k:off(site[k]) for k in ('call','init','deadline','connection','policy') if k in site}
     result['offsets']={k:off(result[k]) for k in ('call','init','deadline','connection','http') if k in result}
     return result
 
