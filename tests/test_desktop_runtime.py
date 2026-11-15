@@ -85,11 +85,12 @@ class RetryScopeReceiptTests(unittest.TestCase):
             nonlocal active,peak
             mode=kwargs.get('compact')
             name=({True:'compact','auto':'automatic','post-turn':'post-turn'}[mode] if mode
-                  else 'encrypted' if kwargs.get('error_code') else 'azure')
+                  else 'encrypted' if kwargs.get('error_code')
+                  else 'wrapped-masked' if '***' in kwargs.get('error_message','') else 'azure')
             with lock:
                 active+=1;peak=max(peak,active)
             try:
-                if name!='post-turn':barrier.wait()
+                if name in validation.SCOPE_PROBES[:4]:barrier.wait()
                 return results[name]
             finally:
                 with lock:active-=1

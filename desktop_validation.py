@@ -96,7 +96,7 @@ def sandbox_valid(matrices):
             == [c['observations'] for c in matrices[1]['cases']])
 
 
-SCOPE_PROBES = ('azure','encrypted','compact','automatic','post-turn')
+SCOPE_PROBES = ('azure','encrypted','compact','automatic','post-turn','wrapped-masked')
 
 
 def scope_results_valid(rows,p):
@@ -168,11 +168,14 @@ def run(resources, target, manifest):
         import sys
         sys.path.insert(0,str(ROOT/'research'))
         from probe_retries import probe
-        from controller.native_errors import AZURE_RESOURCE_MESSAGE, ENCRYPTED_CONTENT_CODE
+        from controller.native_errors import (AZURE_RESOURCE_MESSAGE, MASKED_RESOURCE_MESSAGE,
+                                              RESPONSES_BAD_REQUEST_PREFIX, ENCRYPTED_CONTENT_CODE)
         options=[dict(error_status=400,error_type='invalid_request_error',error_message=AZURE_RESOURCE_MESSAGE+' [trace_id=local-parameters]'),
                  dict(error_status=400,error_type='invalid_request_error',error_code=ENCRYPTED_CONTENT_CODE,
                       error_message='bad response status code 400 (request id: local)'),
-                 dict(compact=True),dict(compact='auto'),dict(compact='post-turn')]
+                 dict(compact=True),dict(compact='auto'),dict(compact='post-turn'),
+                 dict(error_status=400,error_type='invalid_request_error',
+                      error_message=RESPONSES_BAD_REQUEST_PREFIX+MASKED_RESOURCE_MESSAGE+' [hub-] [trace_id=local-parameters]')]
         def run_probe(item):
             name,option=item
             result=probe(str(target/'codex.exe'),4,stream_retries=5,interface='app-server',
@@ -186,8 +189,8 @@ def run(resources, target, manifest):
             scope=list(pool.map(run_probe,zip(SCOPE_PROBES,options)))
         if not scope_results_valid(scope,p):
             raise ControllerError('新参数的两类错误或压缩重试验收失败，未切换入口。')
-    matrices = [sandbox_matrix(resources / 'codex.exe', work, 'official', registered=True),
-                sandbox_matrix(target / 'codex.exe', work, 'copy', registered=False)]
+    matrices = [sandbox_matrix(resources / 'codex.exe', work, 'official'),
+                sandbox_matrix(target / 'codex.exe', work, 'copy')]
     if not sandbox_valid(matrices):
         raise ControllerError('原版与副本的 unelevated 沙盒对照未通过；详见本次验证日志。')
     return dict(format=3, config_policy='user-managed', trial_eligible=True, profile=p,
@@ -195,4 +198,4 @@ def run(resources, target, manifest):
                 official_files=manifest['official_files'],
                 recipe_sha256=manifest['recipe_sha256'], desktop_rules_sha256=manifest['desktop_rules_sha256'],
                 retry=retry, retry_scope=scope, comparisons=matrices,
-                scope='Isolated app-server SSE and unelevated command/exec. No elevated/service or firewall equivalence claim.')
+                scope='Isolated app-server SSE and standalone-override unelevated command/exec. No registered-package, elevated/service or firewall equivalence claim.')

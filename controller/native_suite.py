@@ -1,6 +1,8 @@
 """Loopback acceptance suite used for each newly encountered engine build."""
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import time
@@ -15,12 +17,41 @@ REQUIRED_CASES = ('zero-budget','http-fixed','http-429','quota-terminal','http-5
                   'millisecond-fixed')
 JITTER_CASES = ('jitter-http','jitter-cross-second','jitter-millisecond')
 SCOPE_CASES = ('azure-zero','azure-budget','azure-success',
+               'masked-zero','masked-budget','masked-success',
+               'wrapped-azure-zero','wrapped-azure-budget','wrapped-azure-success',
+               'wrapped-masked-zero','wrapped-masked-budget','wrapped-masked-success',
                'encrypted-zero','encrypted-budget','encrypted-success',
                'bad-response-terminal','code-in-message-terminal',
+               'resource-example-terminal','resource-near-match-terminal',
                'compact-zero','compact-fixed','compact-above-five','compact-success',
-               'compact-azure','compact-encrypted','compact-jitter',
+               'compact-azure','compact-wrapped-masked','compact-encrypted','compact-jitter',
                'automatic-zero','automatic-budget','automatic-success',
                'post-turn-budget','post-turn-jitter')
+
+
+def _remove_probe_tree(directory, work):
+    """Wait only for transient Windows sharing locks after probes have exited.
+
+    tempfile's Python 3.10 cleanup can turn a locked EXE into WinError 267 by
+    trying to recurse into the file. Retry the remaining temporary tree removal,
+    not the acceptance tests; persistent locks and other errors still fail.
+    """
+    directory, work = Path(directory).resolve(), Path(work).resolve()
+    if directory.parent != work or not directory.name.startswith('native-'):
+        raise ControllerError('临时验收清理路径超出指定目录。')
+    deadline = None
+    while True:
+        try:
+            shutil.rmtree(directory)
+            return
+        except OSError as error:
+            if getattr(error,'winerror',None) not in (32,33):
+                raise
+            if deadline is None:
+                deadline = time.monotonic()+15
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(.2)
 
 
 def _stage(data, path, settings=None):
@@ -135,8 +166,9 @@ def run_suite(data, owner):
     jitter_supported = (sha(data) != SUPPORTED_SHA256 and
                         locate(data, ControllerError)['family'] == 'responses-sampling-x64-outlined')
     report = dict(cases=[], supports_jitter=jitter_supported, supports_retry_scope=jitter_supported, max_workers=4)
-    with tempfile.TemporaryDirectory(dir=work,prefix='native-') as temporary:
-        directory = Path(temporary)
+    with ExitStack() as cleanup:
+        directory = Path(tempfile.mkdtemp(dir=work,prefix='native-'))
+        cleanup.callback(_remove_probe_tree,directory,work)
         original = _stage(data, directory/'original'/'codex.exe')
         staged = {}
         staging_seconds = 0
@@ -160,12 +192,10 @@ def run_suite(data, owner):
                 assert not result['timed_out'] and result['exit_code'] == 1
                 assert result['requests'] in (1,2), f'baseline HTTP {status}: unexpected budget'
                 original_classification[status] = result['requests'] > 1
-            recovery = pool.submit(_recovery, data, directory/'recovery', image(profile(3,'.125'))[1])
-            pending.append(recovery)
+            cases = []
             def case(name,count,delay,expected,success=False,jitter='0',**options):
                 settings = profile(count,delay,jitter)
-                future = pool.submit(_case,probe,image(settings)[0],name,settings,expected,success,options,owner.logger)
-                pending.append(future)
+                cases.append((name,settings,expected,success,options))
 
             # Start the longest probe early; every scenario still runs in full.
             case('thousand-retries',1000,'0',1001,stop_after=1100,timeout=90)
@@ -189,13 +219,20 @@ def run_suite(data, owner):
                 case('jitter-http',8,'.1',9,jitter='.07',stop_after=10)
                 case('jitter-cross-second',8,'1',9,jitter='.07',stop_after=10,interface='app-server')
                 case('jitter-millisecond',8,'.005',9,jitter='.004',stop_after=10)
-                from .native_errors import AZURE_RESOURCE_MESSAGE, ENCRYPTED_CONTENT_CODE
+                from .native_errors import (AZURE_RESOURCE_MESSAGE, MASKED_RESOURCE_MESSAGE,
+                                            RESPONSES_BAD_REQUEST_PREFIX, ENCRYPTED_CONTENT_CODE)
                 azure=dict(error_status=400,error_type='invalid_request_error',
                            error_message=AZURE_RESOURCE_MESSAGE+' [trace_id=local-acceptance]')
                 encrypted=dict(error_status=400,error_type='invalid_request_error',
                                error_message='bad response status code 400 (request id: local)',
                                error_code=ENCRYPTED_CONTENT_CODE)
-                for label,error in [('azure',azure),('encrypted',encrypted)]:
+                variants=[('azure',azure)]
+                for label,message in [('masked',MASKED_RESOURCE_MESSAGE),
+                                      ('wrapped-azure',RESPONSES_BAD_REQUEST_PREFIX+AZURE_RESOURCE_MESSAGE),
+                                      ('wrapped-masked',RESPONSES_BAD_REQUEST_PREFIX+MASKED_RESOURCE_MESSAGE)]:
+                    variants.append((label,dict(azure,error_message=message+' [hub-] [trace_id=local-acceptance]')))
+                wrapped_masked=variants[-1][1]
+                for label,error in variants+[('encrypted',encrypted)]:
                     case(label+'-zero',0,'.5',1,interface='app-server',**error)
                     case(label+'-budget',3,'.125',4,interface='app-server',**error)
                     case(label+'-success',3,'.125',3,success=True,stop_after=2,interface='app-server',**error)
@@ -203,11 +240,16 @@ def run_suite(data, owner):
                      error_message='bad response status code 400')
                 case('code-in-message-terminal',3,'.125',1,interface='app-server',error_status=400,
                      error_message='example: "code":"invalid_encrypted_content"',error_code='invalid_parameter')
+                case('resource-example-terminal',3,'.125',1,interface='app-server',
+                     **dict(wrapped_masked,error_message='example: '+wrapped_masked['error_message']))
+                case('resource-near-match-terminal',3,'.125',1,interface='app-server',
+                     **dict(wrapped_masked,error_message=wrapped_masked['error_message'].replace('***','***x')))
                 case('compact-zero',0,'.5',1,interface='app-server',compact=True)
                 case('compact-fixed',3,'.125',4,interface='app-server',compact=True)
                 case('compact-above-five',8,'.1',9,interface='app-server',compact=True,stop_after=10)
                 case('compact-success',3,'.125',3,success=True,stop_after=2,interface='app-server',compact=True)
                 case('compact-azure',3,'.125',4,interface='app-server',compact=True,**azure)
+                case('compact-wrapped-masked',3,'.125',4,interface='app-server',compact=True,**wrapped_masked)
                 case('compact-encrypted',3,'.125',4,interface='app-server',compact=True,**encrypted)
                 case('compact-jitter',8,'.1',9,jitter='.07',stop_after=10,interface='app-server',compact=True)
                 case('automatic-zero',0,'.5',1,interface='app-server',compact='auto')
@@ -215,13 +257,19 @@ def run_suite(data, owner):
                 case('automatic-success',3,'.125',3,success=True,stop_after=2,interface='app-server',compact='auto')
                 case('post-turn-budget',8,'.1',9,stop_after=10,interface='app-server',compact='post-turn')
                 case('post-turn-jitter',8,'.1',9,jitter='.07',stop_after=10,interface='app-server',compact='post-turn')
+            # Large image copies/patches and recovery can hold Python's GIL,
+            # delaying the loopback servers that measure millisecond waits.
+            # Finish all mutable image work before starting any timed probe;
+            # keep the same interval bounds and all recovery checks.
+            for _,settings,_,_,_ in cases:
+                image(settings)
+            report.update(_recovery(data,directory/'recovery',image(profile(3,'.125'))[1]))
+            report['recovery_seconds'] = report.pop('seconds')
+            for name,settings,expected,success,options in cases:
+                future = pool.submit(_case,probe,image(settings)[0],name,settings,expected,success,options,owner.logger)
+                pending.append(future)
             for future in as_completed(pending):
-                result = future.result()
-                if future is recovery:
-                    report.update(result)
-                    report['recovery_seconds'] = report.pop('seconds')
-                else:
-                    report['cases'].append(result)
+                report['cases'].append(future.result())
         finally:
             # Drain running probes before deleting any image. Worker Job Object
             # cancellation still terminates this process and all its children.

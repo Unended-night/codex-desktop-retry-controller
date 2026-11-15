@@ -1,6 +1,7 @@
 """Acceptance scheduling uses immutable images and preserves every gate."""
 import contextlib
 import logging
+import os
 from pathlib import Path
 import struct
 import sys
@@ -30,6 +31,24 @@ class NativeSuiteTests(unittest.TestCase):
         baseline_barrier = threading.Barrier(4,timeout=5)
         active = maximum = 0
         observed = {}
+        prepared = set()
+        recovery_done = False
+        stage, recovery = suite._stage, suite._recovery
+        def prepare_image(data,path,settings=None):
+            self.assertEqual(active,0,'image preparation overlaps a probe')
+            self.assertFalse(observed,'image preparation follows a timed probe')
+            result = stage(data,path,settings)
+            if settings is not None:
+                prepared.add(tuple(sorted(settings.items())))
+            return result
+        def recover(*args):
+            nonlocal recovery_done
+            self.assertEqual(active,0,'recovery overlaps a probe')
+            if fail == 'recovery':
+                raise RuntimeError('fixture probe failed: recovery')
+            result = recovery(*args)
+            recovery_done = True
+            return result
         def probe(exe, retries, **options):
             nonlocal active, maximum
             with lock:
@@ -42,16 +61,21 @@ class NativeSuiteTests(unittest.TestCase):
                     baseline_barrier.wait()
                     requests = 1 if options['error_status'] == 400 else 2
                 else:
+                    self.assertTrue(recovery_done,'timed probe precedes recovery')
+                    self.assertEqual(len(prepared),11,'timed probe precedes image preparation')
                     with lock:
                         observed.setdefault(exe,set()).add((count,base,spread))
                     time.sleep(.005)
                     self.assertEqual(Path(exe).read_bytes(),data)
-                    if fail and count == 0:
+                    if fail is True and count == 0:
                         raise RuntimeError('fixture probe failed')
                     requests = count+1
-                    from controller.native_errors import AZURE_RESOURCE_MESSAGE
+                    from controller.native_errors import (AZURE_RESOURCE_MESSAGE, MASKED_RESOURCE_MESSAGE,
+                                                          RESPONSES_BAD_REQUEST_PREFIX)
                     retryable400=(options.get('error_code')=='invalid_encrypted_content' or
-                                  options.get('error_message','').startswith(AZURE_RESOURCE_MESSAGE))
+                                  options.get('error_message','').startswith(tuple(
+                                      prefix+message for prefix in ('',RESPONSES_BAD_REQUEST_PREFIX)
+                                      for message in (AZURE_RESOURCE_MESSAGE,MASKED_RESOURCE_MESSAGE))))
                     if options.get('error_code') == 'insufficient_quota' or (options.get('error_status') == 400 and not retryable400 and not options.get('compact')):
                         requests = 1
                     if options.get('succeed'):
@@ -72,6 +96,8 @@ class NativeSuiteTests(unittest.TestCase):
             cleanup.enter_context(patch('controller.verification.build_plan',side_effect=self.plan))
             cleanup.enter_context(patch('controller.native.locate',return_value={'family':'responses-sampling-x64-outlined'}))
             cleanup.enter_context(patch.object(probe_retries,'probe',side_effect=probe))
+            cleanup.enter_context(patch.object(suite,'_stage',side_effect=prepare_image))
+            cleanup.enter_context(patch.object(suite,'_recovery',side_effect=recover))
             if fail:
                 with self.assertRaisesRegex(ControllerError,'fixture probe failed'):
                     verify(owner,self.data)
@@ -96,6 +122,10 @@ class NativeSuiteTests(unittest.TestCase):
     def test_failed_probe_drains_workers_and_never_creates_approval(self):
         self.execute(fail=True)
 
+    def test_failed_recovery_never_starts_timed_probes_or_creates_approval(self):
+        _,observed = self.execute(fail='recovery')
+        self.assertEqual(observed,{})
+
     def test_staged_image_must_match_bytes_written_to_disk(self):
         original = Path.write_bytes
         def corrupt(path, data):
@@ -109,3 +139,40 @@ class NativeSuiteTests(unittest.TestCase):
             return dict(timed_out=False,requests=2,exit_code=1,intervals_seconds=[])
         with self.assertRaisesRegex(AssertionError,'missing request intervals'):
             suite._case(probe,Path('fixture.exe'),'fixture',profile(1,'1'),2,False,{},logging.getLogger('fixture'))
+
+    @unittest.skipUnless(os.name=='nt','Windows file sharing')
+    def test_cleanup_waits_for_a_sharing_lock_then_removes_the_tree(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)/'native-locked'
+            directory.mkdir()
+            exe = directory/'codex.exe'
+            exe.write_bytes(b'fixture')
+            with exe.open('rb') as held:
+                with patch.object(suite.time,'sleep',side_effect=lambda _:held.close()) as sleep:
+                    suite._remove_probe_tree(directory,Path(folder))
+                sleep.assert_called_once_with(.2)
+            self.assertFalse(directory.exists())
+
+    def test_cleanup_keeps_permission_errors_and_does_not_wait(self):
+        error = OSError('access denied');error.winerror=5
+        with tempfile.TemporaryDirectory() as folder, patch.object(suite.shutil,'rmtree',side_effect=error) as remove, patch.object(suite.time,'sleep') as sleep:
+            with self.assertRaises(OSError) as caught:
+                suite._remove_probe_tree(Path(folder)/'native-denied',Path(folder))
+            self.assertIs(caught.exception,error)
+            sleep.assert_not_called()
+            remove.assert_called_once()
+
+    def test_cleanup_persistent_sharing_lock_keeps_the_original_error(self):
+        error = OSError('still in use');error.winerror=32
+        with tempfile.TemporaryDirectory() as folder, patch.object(suite.shutil,'rmtree',side_effect=error) as remove, patch.object(suite.time,'sleep'), patch.object(suite.time,'monotonic',side_effect=[0,0,16]):
+            with self.assertRaises(OSError) as caught:
+                suite._remove_probe_tree(Path(folder)/'native-busy',Path(folder))
+            self.assertIs(caught.exception,error)
+            self.assertEqual(remove.call_count,2)
+
+    def test_cleanup_refuses_paths_outside_the_verification_directory(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(suite.shutil,'rmtree') as remove:
+            for path in (Path(folder),Path(folder)/'native-elsewhere',Path(folder)/'verification/other'):
+                with self.assertRaisesRegex(ControllerError,'清理路径'):
+                    suite._remove_probe_tree(path,Path(folder)/'verification')
+            remove.assert_not_called()

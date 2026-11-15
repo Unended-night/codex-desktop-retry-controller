@@ -5,8 +5,12 @@ import struct
 from .native_extension import Code
 from .native_v4 import classifier_flow, delay_code, mem, only, reg, register_families
 
-AZURE_RESOURCE_MESSAGE = ('The requested item was created under a different Azure OpenAI resource. '
-                          'Use the same resource that created the item to access it.')
+RESOURCE_MESSAGE_START = 'The requested item was created under a different '
+RESOURCE_MESSAGE_END = (' OpenAI resource. '
+                        'Use the same resource that created the item to access it.')
+AZURE_RESOURCE_MESSAGE = RESOURCE_MESSAGE_START+'Azure'+RESOURCE_MESSAGE_END
+MASKED_RESOURCE_MESSAGE = RESOURCE_MESSAGE_START+'***'+RESOURCE_MESSAGE_END
+RESPONSES_BAD_REQUEST_PREFIX = 'OpenAI Responses bad request: '
 ENCRYPTED_CONTENT_CODE = 'invalid_encrypted_content'
 
 
@@ -222,8 +226,7 @@ def error_policy(s, p):
     c.relative('0f83','delay')  # Native nonterminal result.
     c.emit('48b8');c.emit(struct.pack('<Q',s['invalid_request']['tag']))
     c.emit('483901');c.relative('0f85','return')
-    for index,(key,value) in enumerate([(b'"code"',b'"'+ENCRYPTED_CONTENT_CODE.encode()+b'"'),
-                                      (b'"message"',b'"'+AZURE_RESOURCE_MESSAGE.encode())]):
+    for index,key in enumerate((b'"code"',b'"message"')):
         name=f'field{index}'
         next_field=f'field{index+1}' if index==0 else 'return'
         c.label(name)
@@ -262,8 +265,21 @@ def error_policy(s, p):
         whitespace(name+'ws1')
         literal(b':',name+'advance')
         whitespace(name+'ws2')
-        literal(value,name+'advance')
-        if index==1:
+        if index==0:
+            literal(b'"'+ENCRYPTED_CONTENT_CODE.encode()+b'"',name+'advance')
+        else:
+            literal(b'"',name+'advance')
+            # literal advances R8 only on a complete match. A missing gateway
+            # prefix therefore leaves the original message start untouched.
+            literal(RESPONSES_BAD_REQUEST_PREFIX.encode(),name+'body')
+            c.label(name+'body')
+            literal(RESOURCE_MESSAGE_START.encode(),name+'advance')
+            literal(b'Azure',name+'masked')
+            c.relative('e9',name+'suffix')
+            c.label(name+'masked')
+            literal(b'***',name+'advance')
+            c.label(name+'suffix')
+            literal(RESOURCE_MESSAGE_END.encode(),name+'advance')
             c.emit('4d39d8');c.relative('0f83',name+'advance')
             c.emit('41803822');c.relative('0f84','delay')
             c.emit('41803820');c.relative('0f85',name+'advance')

@@ -38,10 +38,21 @@ def record(message='',code=None):
     return json.dumps({'error':{'message':message,'code':code}}).encode()
 positive=[record(AZURE),record(AZURE+' [trace_id=local]'),record('bad response status code 400','invalid_encrypted_content'),
           b'{"error": {"code" \r\n:\t "invalid_encrypted_content"}}']
+# Keep the reported gateway response independent of the emitter's constants.
+reported=('OpenAI Responses bad request: The requested item was created under a different *** OpenAI resource. '
+          'Use the same resource that created the item to access it. [hub-] [trace_id=local]')
+wrapped='OpenAI Responses bad request: '
+masked=AZURE.replace('Azure','***')
+positive += [record(reported),record(masked),record(wrapped+AZURE),record(wrapped+masked)]
 negative=[b'',record('bad response status code 400'),record('invalid_encrypted_content','invalid_parameter'),
           record('example: "code":"invalid_encrypted_content"'),record(AZURE+'x'),
           record('', 'invalid_encrypted_content_extra'),record('example '+AZURE),b'{"message":"short"}',
           b'"code" : ',b'"code" : "invalid_encrypted_content']
+negative += [record(wrapped+'bad response status code 400'),record('example '+masked),
+             record('example '+reported),record(wrapped+'example '+masked),
+             record(masked.replace('***','****')),record(masked.replace('***','***x')),
+             record(wrapped+masked+'x'),record(wrapped+masked.replace('same resource','another resource')),
+             record(wrapped+wrapped+masked),record('example: "message":"'+masked+'"')]
 # A real inaccessible page immediately follows each native String. Prefixes
 # of positive strings test every truncation, including whitespace and quotes.
 region=k.VirtualAlloc(None,8192,0x3000,0x04);assert region;buffers.append(region)

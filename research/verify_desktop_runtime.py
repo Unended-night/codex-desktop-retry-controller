@@ -74,10 +74,8 @@ def prepare(resources):
 
 
 class Rpc:
-    def __init__(self, exe, cwd, env, registered):
-        args = [str(exe), 'app-server', '--stdio']
-        if registered:
-            args += ['-c', 'features.windows_sandbox_service=true']
+    def __init__(self, exe, cwd, env):
+        args = [str(exe), 'app-server', '--stdio', '-c', 'features.windows_sandbox_service=true']
         self.proc = subprocess.Popen(args, cwd=str(cwd), env=env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', errors='replace',
             creationflags=subprocess.CREATE_NO_WINDOW)
@@ -158,7 +156,7 @@ print(json.dumps(r),flush=True)
 '''
 
 
-def sandbox_matrix(exe, parent, label, registered=False):
+def sandbox_matrix(exe, parent, label):
     case = parent / label
     case.mkdir()
     home, workspace, outside, temp = [case / s for s in ('home','workspace','outside','temp')]
@@ -176,18 +174,18 @@ def sandbox_matrix(exe, parent, label, registered=False):
            and k.upper() not in ('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY')}
     env.update(CODEX_HOME=str(home), CODEX_LOCAL_PROBE_KEY='not-a-real-key',
                TMP=str(temp), TEMP=str(temp), TMPDIR=str(temp), PYTHONDONTWRITEBYTECODE='1')
-    if registered:
-        for key in ('CODEX_WINDOWS_REGISTERED_CORE','CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY'):
-            if key in os.environ: env[key] = os.environ[key]
-    else:
-        env['CODEX_CLI_PATH'] = str(exe)
+    # Both binaries are launched as standalone overrides, without MSIX process
+    # identity. Never inherit registered-Core markers from the hosting desktop:
+    # a signed file in WindowsApps does not give Popen a package identity.
+    # Keep the desktop's sandbox feature flag identical on both sides.
+    env['CODEX_CLI_PATH'] = str(exe)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
         def do_GET(self):
             self.send_response(200);self.end_headers();self.wfile.write(b'loopback-ok')
     server = ThreadingHTTPServer(('127.0.0.1',0), Handler)
     worker = threading.Thread(target=server.serve_forever, daemon=True);worker.start()
-    rpc = Rpc(exe, workspace, env, registered)
+    rpc = Rpc(exe, workspace, env)
     results = []
     try:
         init = rpc.call('initialize', {'clientInfo':{'name':'sandbox_equivalence_probe','version':'1'},
@@ -218,7 +216,7 @@ def sandbox_matrix(exe, parent, label, registered=False):
             print(json.dumps({'engine':label,**item},ensure_ascii=False),flush=True)
     finally:
         rpc.close();server.shutdown();server.server_close();worker.join()
-    return dict(label=label, engine=str(exe), registered_env_inherited={
+    return dict(label=label, engine=str(exe), launch_mode='standalone-override', registered_env_inherited={
         k:k in env for k in ('CODEX_WINDOWS_REGISTERED_CORE','CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY')},
         cases=results, stderr_tail=''.join(rpc.stderr)[-2200:])
 
@@ -245,8 +243,8 @@ def main():
         assert all(.96<=v<=1.5 for v in report['retry']['intervals_seconds'])
         assert report['retry']['turn_exit_code']==0
         print(json.dumps({'retry_passed':True,'intervals':report['retry']['intervals_seconds']}),flush=True)
-        for label,exe,registered in [('official',installed,True),('copy',target/'codex.exe',False)]:
-            result=sandbox_matrix(exe,testroot,label,registered)
+        for label,exe in [('official',installed),('copy',target/'codex.exe')]:
+            result=sandbox_matrix(exe,testroot,label)
             report['comparisons'].append(result)
             atomic_json(ROOT/'logs/desktop-runtime-candidate.json',report)
         observations=[[x['observations'] for x in e['cases']] for e in report['comparisons']]
