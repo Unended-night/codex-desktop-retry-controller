@@ -47,6 +47,27 @@ def compile_returned(nanos):
     return c.CFUNCTYPE(c.c_ulonglong,c.c_void_p)(allocate(wrapper+body))
 returned=compile_returned(0xffffffff)
 returned_retry=compile_returned(1234)
+
+def compile_returned_jump(nanos):
+    # Short native CMP+Jcc sites jump to a leaf instead of adding a CALL with
+    # no native home space. Exercise both direct native exits in a real child.
+    address=k.VirtualAlloc(None,16384,0x3000,0x04);assert address;buffers.append(address)
+    body=error_policy(dict(returned_classifier={'deadline_only_tags':[37]},none_value=0xffffffff,
+                          error_reload=bytes.fromhex('4889c9'),policy_present=address+32,policy_absent=address+48,
+                          invalid_request=dict(tag=99,tag_offset=0,pointer=16,length=24)),
+                      profile(3,'.125'),address=address+80)
+    start=bytes.fromhex('ba')+struct.pack('<I',nanos)+bytes.fromhex('e9')+struct.pack('<i',70)
+    present=bytes.fromhex('89d0c3')
+    absent=bytes.fromhex('48b800000000010000004809d0c3')
+    raw=start.ljust(32,b'\xcc')+present
+    raw=raw.ljust(48,b'\xcc')+absent
+    raw=raw.ljust(80,b'\xcc')+body
+    c.memmove(address,raw,len(raw));old=c.c_ulong()
+    assert k.VirtualProtect(address,16384,0x20,c.byref(old))
+    assert k.FlushInstructionCache(c.c_void_p(-1),address,len(raw))
+    return c.CFUNCTYPE(c.c_ulonglong,c.c_void_p)(address)
+jump_returned=compile_returned_jump(0xffffffff)
+jump_retry=compile_returned_jump(1234)
 def record(message='',code=None):
     return json.dumps({'error':{'message':message,'code':code}}).encode()
 positive=[record(AZURE),record(AZURE+' [trace_id=local]'),record('bad response status code 400','invalid_encrypted_content'),
@@ -76,7 +97,7 @@ def invoke(raw,tag=99):
     error=(c.c_ulonglong*4)(tag,len(raw),start,len(raw))
     return terminal(c.addressof(error))&0xffffffff
 try:
-    for terminal in (terminal,returned):
+    for terminal in (terminal,returned,jump_returned):
         for raw in positive:assert invoke(raw)==125000000,raw
         for raw in negative:assert invoke(raw)==0xffffffff,raw
         for raw in positive:
@@ -87,8 +108,11 @@ try:
     assert native_retry(c.addressof(invalid))&0xffffffff==125000000
     assert returned(c.addressof(invalid))==0x1ffffffff  # None and ZF=1.
     assert returned_retry(c.addressof(invalid))==125000000  # Some and ZF=0.
+    assert jump_returned(c.addressof(invalid))==0x1ffffffff
+    assert jump_retry(c.addressof(invalid))==125000000
     invalid[0]=37
     assert returned(c.addressof(invalid))==125000000  # Deadline-only native arm.
+    assert jump_returned(c.addressof(invalid))==125000000
 finally:
     for address in buffers:assert k.VirtualFree(address,0,0x8000)
 print('classifier guard-page checks passed')

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from desktop_trial import digest, launch_environment, running_desktops, selection
+from desktop_trial import digest, launch_environment, running_desktops, selection, desktop_engines
 
 
 class LauncherTest(unittest.TestCase):
@@ -73,6 +73,15 @@ class LauncherTest(unittest.TestCase):
         processes=[{'ProcessId':7,'ExecutablePath':r'C:\Program Files\WindowsApps\OpenAI.Codex_1\app\ChatGPT.exe'},
                    {'ProcessId':8,'ExecutablePath':r'C:\Other\ChatGPT.exe'}]
         self.assertEqual([p['ProcessId'] for p in running_desktops(processes)],[7])
+
+    def test_running_engine_is_found_through_only_the_owned_wrapper_chain(self):
+        rows = [dict(ProcessId=2, ParentProcessId=1, ExecutablePath='codex-guard.exe'),
+                dict(ProcessId=3, ParentProcessId=2, ExecutablePath='python.exe'),
+                dict(ProcessId=4, ParentProcessId=3, ExecutablePath='codex.exe'),
+                dict(ProcessId=5, ParentProcessId=99, ExecutablePath='codex.exe'),
+                dict(ProcessId=6, ParentProcessId=1, ExecutablePath='unrelated.exe'),
+                dict(ProcessId=7, ParentProcessId=6, ExecutablePath='codex.exe')]
+        self.assertEqual([row['ProcessId'] for row in desktop_engines(rows, {1})], [4])
 
 
 if __name__=='__main__':unittest.main()

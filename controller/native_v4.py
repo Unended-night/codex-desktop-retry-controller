@@ -219,6 +219,9 @@ def field_address(i, state, field):
 
 
 def outer(ins, call_index, helper, data, off):
+    if isinstance(helper, dict) and helper.get('delegated'):
+        from .native_delegate import sampling
+        return sampling(ins, call_index, helper, data, off)
     import capstone.x86_const as x
     call=ins[call_index]
     before=ins[call_index-2]
@@ -760,6 +763,7 @@ def responses_transport(data, entry, function, off, va, refs):
 
 def locate_outlined(data, function, off, va, refs, cs, *, has_reference=None, reference_candidates=None):
     candidates=[]
+    rejected_sampling=[]
     # A cheap scan narrows decoding to calls returning an Option<Duration>.
     pattern=(rb'\xe8....(?:\x90|\x66\x90|\x0f\x1f\x00|\x0f\x1f\x40.){0,4}'
              rb'(?:\x81\xfa....|\x83\xfa.)(?:[\x74\x75].|\x0f[\x84\x85]....)')
@@ -774,11 +778,25 @@ def locate_outlined(data, function, off, va, refs, cs, *, has_reference=None, re
             try:
                 policy = classifier(helper,none_value)
             except ValueError:
-                from .native_return import returned_classifier
-                policy = returned_classifier(helper,none_value,data,off)
-            candidates.append(outer(ins,n,policy,data,off))
+                from .native_return import returned_classifier, delegated_classifier
+                try:
+                    policy = returned_classifier(helper,none_value,data,off)
+                except ValueError:
+                    policy = delegated_classifier(helper,none_value,data,off,function)
+            try:
+                candidates.append(outer(ins,n,policy,data,off))
+            except ValueError as exc:
+                before=ins[n-2]
+                if (isinstance(policy,dict) and policy.get('delegated') and before.mnemonic=='mov'
+                        and before.operands[0].type==3 and before.operands[1].type==1
+                        and before.reg_name(before.operands[1].reg)=='rdx'
+                        and before.reg_name(before.operands[0].mem.base) not in ('rbp','rsp')):
+                    rejected_sampling.append(str(exc))
+                raise
         except (ValueError,KeyError,IndexError,StopIteration):
             continue
+    if rejected_sampling:
+        raise ValueError('unproven delegated sampling instance: '+rejected_sampling[0])
     initialized=[s for s in candidates if 'init' in s]
     if initialized:
         result=only(initialized,'sampling policy')

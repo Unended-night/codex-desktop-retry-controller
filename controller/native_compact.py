@@ -116,9 +116,9 @@ def returned_compact_sites(ins, call_index, data, off, classification):
     gates=[]
     for k in range(max(0,call_index-20),call_index-5):
         load,compare=ins[k:k+2]
-        if (load.mnemonic=='mov' and reg(load.operands[0],counter) and mem(load.operands[1],state,attempt)
+        if (load.mnemonic=='mov' and reg(load.operands[0],counter) and mem(load.operands[1],disp=attempt)
                 and compare.mnemonic=='cmp' and reg(compare.operands[0],counter)
-                and mem(compare.operands[1],state) and compare.operands[1].size==8):
+                and mem(compare.operands[1],load.operands[1].mem.base) and compare.operands[1].size==8):
             n=k+2
             if ins[n].mnemonic=='mov' and ins[n].operands[0].type==3 and ins[n].operands[0].size==1:
                 n+=1  # A flag-neutral async-state byte store.
@@ -126,19 +126,48 @@ def returned_compact_sites(ins, call_index, data, off, classification):
             if jump.mnemonic=='jae' and jump.operands[0].type==2:
                 gates.append((k,n,compare.operands[1].mem.disp,jump.operands[0].imm))
     gate,branch,budget,exhausted=only(gates,'compaction classifier budget')
+    gate_state=ins[gate].operands[1].mem.base
     families=register_families()
     # Native memcpy constructs the exact error passed to the classifier.
-    pointer,size,copy_arg,copy_call=ins[call_index-8:call_index-4]
-    if not (pointer.mnemonic=='lea' and reg(pointer.operands[0],error_reg) and mem(pointer.operands[1],state)
+    copy_start=call_index-8
+    if (ins[call_index-6].mnemonic=='mov' and reg(ins[call_index-6].operands[0],x.X86_REG_RDX)):
+        copy_start-=1
+        pointer,size,copy_arg,copy_source,copy_call=ins[copy_start:call_index-4]
+        if not (copy_source.operands[1].type==1 and copy_source.operands[1].size==8):
+            raise ValueError('compaction copied error argument changed')
+    else:
+        pointer,size,copy_arg,copy_call=ins[copy_start:call_index-4]
+    if not (pointer.mnemonic=='lea' and reg(pointer.operands[0],error_reg) and mem(pointer.operands[1],gate_state)
             and size.mnemonic=='mov' and reg(size.operands[0],x.X86_REG_R8D) and size.operands[1].type==2
             and copy_arg.mnemonic=='mov' and reg(copy_arg.operands[0],x.X86_REG_RCX) and reg(copy_arg.operands[1],error_reg)
             and copy_call.mnemonic=='call' and copy_call.operands[0].type==2):
         raise ValueError('compaction classifier error source changed')
-    for i in ins[branch+1:call_index-8]:
-        if (i.mnemonic!='mov' or not mem(i.operands[0],state) or i.operands[0].size!=1
+    alias=False
+    for i in ins[branch+1:copy_start]:
+        if (i.mnemonic=='mov' and reg(i.operands[0],state) and reg(i.operands[1],gate_state)
+                and i.operands[0].size==i.operands[1].size==8 and gate_state!=state and not alias):
+            alias=True
+            continue
+        if (i.mnemonic!='mov' or not mem(i.operands[0],gate_state) or i.operands[0].size!=1
                 or any(i.operands[0].mem.disp<f+8 and f<i.operands[0].mem.disp+1 for f in (attempt,budget))):
             raise ValueError('compaction gate fallthrough changed')
-    none_value,present,absent=duration_branch(ins,call_index)
+    if gate_state!=state and not alias:
+        raise ValueError('compaction gate state alias is unproven')
+    # The scheduler may restore a nonvolatile frame value between the call and
+    # its Option discriminant comparison. Leave that load in place. It must
+    # preserve RAX/EDX and the saved error pointer used by our leaf policy.
+    policy_index=call_index+1
+    while True:
+        instruction=ins[policy_index]
+        frame_load=(instruction.mnemonic=='mov' and instruction.operands[0].type==1
+                    and instruction.operands[0].reg in nonvolatile-{error_reg}
+                    and instruction.operands[0].size==8
+                    and mem(instruction.operands[1],x.X86_REG_RBP) and instruction.operands[1].size==8)
+        if instruction.mnemonic!='nop' and not frame_load:
+            break
+        policy_index+=1
+    branch_view=ins[:call_index+1]+ins[policy_index:]
+    none_value,present,absent=duration_branch(branch_view,call_index)
     if classification['none_value']!=none_value:
         raise ValueError('compaction classifier None disagrees with caller')
     addresses={i.address:n for n,i in enumerate(ins)}
@@ -149,8 +178,8 @@ def returned_compact_sites(ins, call_index, data, off, classification):
         raise ValueError('compaction returned state reload')
     resumed=reload.operands[0].reg
     slot=reload.operands[1].mem.disp
-    source=next((i for i in reversed(ins[:gate]) if set(families[state]).intersection(i.regs_access()[1])),None)
-    if not (source and source.mnemonic=='mov' and reg(source.operands[0],state)
+    source=next((i for i in reversed(ins[:gate]) if set(families[gate_state]).intersection(i.regs_access()[1])),None)
+    if not (source and source.mnemonic=='mov' and reg(source.operands[0],gate_state)
             and mem(source.operands[1],x.X86_REG_RBP,slot)):
         raise ValueError('compaction returned state disagrees')
     for ref,register,field in [(attempt_ref,x.X86_REG_RCX,attempt),(budget_ref,x.X86_REG_R8,budget)]:
@@ -184,16 +213,35 @@ def returned_compact_sites(ins, call_index, data, off, classification):
                 and zero.operands[1].type==2 and zero.operands[1].imm==0):
             initial.append((default,state_load.address-default.address))
     init,init_size=only(initial,'compaction classifier initialization')
-    policy=ins[call_index+1]
-    while policy.mnemonic=='nop':policy=ins[addresses[policy.address]+1]
-    if min(init_size,policy.size,lnano.size)<5 or exhausted not in addresses or ins[gate].address<=exhausted<dnano.address+dnano.size:
+    policy=ins[policy_index]
+    policy_size=policy.size
+    extra={}
+    if policy_size<5:
+        branch_instruction=ins[addresses[policy.address]+1]
+        policy_size=branch_instruction.address+branch_instruction.size-policy.address
+        extra=dict(policy_present=present,policy_absent=absent)
+    if min(init_size,policy_size,lnano.size)<5 or exhausted not in addresses or ins[gate].address<=exhausted<dnano.address+dnano.size:
         raise ValueError('compaction classifier patch/exit boundary')
-    safe_ranges(ins,[(init.address,init.address+init_size),(policy.address,policy.address+policy.size),
+    safe_ranges(ins,[(init.address,init.address+init_size),(policy.address,policy.address+policy_size),
                      (lnano.address,lnano.address+lnano.size)],data,off)
     return dict(init=off(init.address),init_size=init_size,call=call.address,
-                policy=policy.address,policy_offset=off(policy.address),policy_size=policy.size,
+                policy=policy.address,policy_offset=off(policy.address),policy_size=policy_size,**extra,
                 deadline=off(lnano.address),deadline_size=lnano.size,error_reload=bytes(error_arg.bytes),
                 none_value=none_value,returned_classifier=classification)
+
+
+def compaction_purpose(ins,data,off):
+    prompt=b'Context window exceeded while compacting; removing oldest history item.'
+    for i in ins:
+        for operand in i.operands:
+            if operand.type==3 and i.reg_name(operand.mem.base)=='rip':
+                try:
+                    target=off(i.address+i.size+operand.mem.disp)
+                except ValueError:
+                    continue
+                if prompt in data[target:target+len(prompt)+8]:
+                    return True
+    return False
 
 
 def locate_compaction(data,s,function,off,va,reference_candidates=None):
@@ -216,24 +264,22 @@ def locate_compaction(data,s,function,off,va,reference_candidates=None):
         try:
             _,ins=function(at)
             n=next(n for n,i in enumerate(ins) if i.address==va(at) and i.mnemonic=='call')
+        except (ValueError,KeyError,IndexError,StopIteration):
+            continue
+        purpose=compaction_purpose(ins,data,off)
+        try:
             if 'returned_classifier' in s:
                 sites=returned_compact_sites(ins,n,data,off,s['returned_classifier'])
             else:
                 sites=compact_sites(ins,n,data,off)
-        except (ValueError,KeyError,IndexError,StopIteration):
+        except (ValueError,KeyError,IndexError,StopIteration) as exc:
+            if purpose:
+                raise ValueError('unproven local compaction instance: '+str(exc)) from exc
             continue
         # Both compaction implementations have the history-shrinking branch.
         # Its diagnostic is a supplementary scope anchor; counter/state/Duration
         # flow and the shared backoff target above prove the actual patch sites.
         # Rust's formatting representation prefixes this literal with a length.
-        prompt=b'Context window exceeded while compacting; removing oldest history item.'
-        purpose=False
-        for i in ins:
-            for operand in i.operands:
-                if operand.type==3 and i.reg_name(operand.mem.base)=='rip':
-                    target=off(i.address+i.size+operand.mem.disp)
-                    if prompt in data[target:target+len(prompt)+8]:
-                        purpose=True
         if not purpose:
             raise ValueError('unproven compaction request purpose')
         results[sites['call']]=sites

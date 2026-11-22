@@ -33,12 +33,16 @@ class App(tk.Tk):
         self.max_retries = tk.StringVar(value="25")
         self.interval = tk.StringVar(value="1000")
         self.jitter = tk.StringVar(value="0")
+        self.retry_enabled = tk.BooleanVar(value=True)
+        self.http_enabled = tk.BooleanVar(value=False)
+        self.http_timeout = tk.StringVar(value='300')
         self.unit = tk.StringVar(value="毫秒")
         self.previous_unit = "毫秒"
         self.wait_preview = tk.StringVar()
         self.mode = tk.StringVar(value="custom")
         self.current = tk.StringVar(value="正在检测安装…")
         self.next_start = tk.StringVar(value="")
+        self.feature_status = tk.StringVar(value='')
         self.location = tk.StringVar(value="")
         self.notice = tk.StringVar(value="打开时只检测。保存设置将验证新副本，通过后更新自定义启动入口。")
         self.widgets = []
@@ -61,12 +65,13 @@ class App(tk.Tk):
         style.configure("Accent.TButton", background="#28564a", foreground="white")
         style.map("Accent.TButton", background=[("active", "#346f5e"), ("disabled", "#a9b5af")])
         style.configure("TRadiobutton", background="#f3f1ed", font=("Microsoft YaHei UI", 10))
+        style.configure("TCheckbutton", background="#f3f1ed", font=("Microsoft YaHei UI", 10))
         style.configure("TEntry", padding=8, font=("Microsoft YaHei UI", 12))
         body = ttk.Frame(self, padding=(30, 24))
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="CODEX DESKTOP  /  LOCAL CONTROL", style="Muted.TLabel").pack(anchor="w")
         ttk.Label(body, text="重试，由你设定。", style="Title.TLabel").pack(anchor="w", pady=(6, 6))
-        ttk.Label(body, text="为自定义启动入口配置重试次数与等待间隔，随时切回官方默认。",
+        ttk.Label(body, text="分别设置重试和 HTTP 超时；未适配项保留设置，通过验收的功能可单独使用。",
                   wraplength=740).pack(anchor="w")
         ttk.Separator(body).pack(fill="x", pady=18)
         status = ttk.Frame(body)
@@ -75,10 +80,11 @@ class App(tk.Tk):
         self._button(status, "启动 Codex", self.launch).pack(side="right", padx=(0, 8))
         ttk.Label(status, textvariable=self.current, wraplength=490, font=("Microsoft YaHei UI", 11, "bold")).pack(side="left", fill="x", expand=True)
         ttk.Label(body, textvariable=self.next_start, wraplength=735).pack(anchor="w", pady=(8, 0))
+        ttk.Label(body, textvariable=self.feature_status, wraplength=735).pack(anchor='w', pady=(4,0))
         ttk.Label(body, textvariable=self.location, style="Muted.TLabel", wraplength=735).pack(anchor="w", pady=(8, 12))
         modes = ttk.Frame(body)
         modes.pack(fill="x", pady=(0, 16))
-        for title, value in [("自定义重试", "custom"), ("官方默认", "default")]:
+        for title, value in [("自定义功能", "custom"), ("官方默认", "default")]:
             radio = ttk.Radiobutton(modes, text=title, variable=self.mode, value=value, command=self._mode_changed)
             radio.pack(side="left", padx=(0, 26))
             self.widgets.append(radio)
@@ -92,7 +98,10 @@ class App(tk.Tk):
         fields.columnconfigure(0, weight=1)
         fields.columnconfigure(1, weight=1)
         fields.columnconfigure(2, weight=1)
-        ttk.Label(fields, text="最多重试次数").grid(row=0, column=0, sticky="w")
+        self.retry_check = ttk.Checkbutton(fields, text='自定义重试次数', variable=self.retry_enabled,
+                                          command=self._mode_changed)
+        self.retry_check.grid(row=0,column=0,sticky='w')
+        self.widgets.append(self.retry_check)
         ttk.Label(fields, text="基础等待").grid(row=0, column=1, sticky="w")
         ttk.Label(fields, text="随机扰动（±）").grid(row=0, column=2, sticky="w")
         self.count_entry = ttk.Entry(fields, textvariable=self.max_retries, width=20)
@@ -106,6 +115,17 @@ class App(tk.Tk):
         ttk.Label(fields, text="精度 1 毫秒；最大 60 秒", style="Muted.TLabel").grid(row=2, column=1, sticky="w")
         ttk.Label(fields, text="0 为固定等待", style="Muted.TLabel").grid(row=2, column=2, sticky="w")
         ttk.Label(body, textvariable=self.wait_preview, wraplength=735).pack(anchor='w', pady=(12, 0))
+        timeout = ttk.Frame(body)
+        timeout.pack(fill='x', pady=(12, 0))
+        self.http_check = ttk.Checkbutton(timeout, text='HTTP 响应超时', variable=self.http_enabled,
+                                          command=self._mode_changed)
+        self.http_check.pack(side='left')
+        self.http_entry = ttk.Entry(timeout, textvariable=self.http_timeout, width=8)
+        self.http_entry.pack(side='left', padx=10)
+        ttk.Label(timeout, text='秒（1～600）').pack(side='left')
+        self.widgets.extend((self.http_check,self.http_entry))
+        ttk.Label(body, text='超时结束本次请求，后续重试由引擎处理；关闭自定义重试时使用原生次数与等待。\n正常流式输出不设总时长；适用于显式配置地址的 Responses HTTP/SSE 供应商。',
+                  style='Muted.TLabel', wraplength=735).pack(anchor='w', pady=(4,0))
         ttk.Label(body, text="次数不含首次请求；等待从失败后开始，请求耗时另计。毫秒数是设定精度，实际受系统调度影响。\n保存成功后，正常退出 Codex，再从自定义重试入口或上方按钮启动。",
                   style="Muted.TLabel", wraplength=735).pack(anchor="w", pady=(16, 14))
         actions = ttk.Frame(body)
@@ -133,17 +153,20 @@ class App(tk.Tk):
         self.progress = ttk.Progressbar(body, mode="indeterminate")
         self.progress.pack(fill="x", pady=(0, 10))
         ttk.Label(body, text="最近操作", style="Muted.TLabel").pack(anchor="w")
-        self.history = tk.Text(body, height=5, bg="#e9ece7", fg="#35423b", relief="flat",
+        self.history = tk.Text(body, height=3, bg="#e9ece7", fg="#35423b", relief="flat",
                                font=("Microsoft YaHei UI", 9), padx=10, pady=8, state="disabled", wrap="word")
         self.history.pack(fill="both", expand=True, pady=(6, 0))
-        ttk.Label(body, text="更新后自动适配并验收 · 沿用已保存参数 · 不修改 config.toml",
-                  style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
+        self.footer = ttk.Label(body, text="更新后自动适配并验收 · 沿用已保存参数 · 不修改 config.toml",
+                                style="Muted.TLabel")
+        self.footer.pack(anchor="w", pady=(10, 0))
         self.update_idletasks()
         # Tk font sizes scale with Windows DPI; fixed pixel heights otherwise
         # clip the history and footer at 150% / 200% display scaling.
         width = min(max(820, body.winfo_reqwidth() + 20), self.winfo_screenwidth() - 100)
         height = min(max(720, body.winfo_reqheight() + 70), self.winfo_screenheight() - 100)
-        self.geometry(f"{width}x{height}")
+        left = max(0, (self.winfo_screenwidth()-width)//2)
+        top = max(0, (self.winfo_screenheight()-height-80)//2)
+        self.geometry(f"{width}x{height}+{left}+{top}")
         self.minsize(min(width, 820), height)
 
     def _button(self, parent, title, command, style="TButton"):
@@ -153,13 +176,21 @@ class App(tk.Tk):
 
     def _mode_changed(self):
         state = "normal" if self.mode.get() == "custom" and not self.busy else "disabled"
-        self.count_entry.configure(state=state)
-        self.delay_entry.configure(state=state)
-        self.jitter_entry.configure(state=state)
-        self.unit_box.configure(state='readonly' if state == 'normal' else 'disabled')
+        retry_state=state if self.retry_enabled.get() else 'disabled'
+        self.retry_check.configure(state=state)
+        self.count_entry.configure(state=retry_state)
+        self.delay_entry.configure(state=retry_state)
+        self.jitter_entry.configure(state=retry_state)
+        self.http_check.configure(state=state)
+        self.http_entry.configure(state=state if self.http_enabled.get() else 'disabled')
+        self.unit_box.configure(state='readonly' if retry_state == 'normal' else 'disabled')
+        self._time_changed()
         self._permissions()
 
     def _time_changed(self, *_):
+        if not self.retry_enabled.get():
+            self.wait_preview.set('自定义重试关闭：次数与等待使用 Codex 原生设置；不等于禁止重试。')
+            return
         try:
             p = profile(0, self.interval.get(), self.jitter.get(), unit='ms' if self.unit.get() == '毫秒' else 's')
             base, spread = p['interval_ms'], p.get('jitter_ms', 0)
@@ -186,8 +217,8 @@ class App(tk.Tk):
         self._time_changed()
 
     def _permissions(self):
-        compatible = self.detected.get("compatible", False)
-        ready = not self.busy and compatible
+        # Native structure recognition cannot gate the independent HTTP layer.
+        ready = not self.busy and self.path is not None
         self.apply_button.configure(state="normal" if ready or (not self.busy and self.mode.get() == "default") else "disabled")
         self.restore_button.configure(state="normal" if not self.busy else "disabled")
         self.verify_button.configure(state="normal" if ready else "disabled")
@@ -270,11 +301,29 @@ class App(tk.Tk):
         divisor = 1 if self.unit.get() == '毫秒' else 1000
         self.interval.set(format(Decimal(p['interval_ms']) / divisor, 'f'))
         self.jitter.set(format(Decimal(p.get('jitter_ms', 0)) / divisor, 'f'))
+        self.http_enabled.set(bool(p.get('http_timeout_ms')))
+        self.retry_enabled.set(p.get('retry_enabled',True))
+        self.http_timeout.set(format(Decimal(p.get('http_timeout_ms',300000))/1000,'f'))
+        labels=[]
+        for name,label,wanted in (('retry','自定义重试',self.retry_enabled.get()),
+                                   ('http_timeout','HTTP 超时',self.http_enabled.get())):
+            item=result.get('features',{}).get(name,{})
+            state=item.get('state','pending' if wanted else 'disabled') if result['enabled'] else 'disabled'
+            description={'ready':'已验收','unavailable':'待适配，设置已保留','disabled':'已关闭','pending':'待验收'}[state]
+            labels.append(label+'：'+description)
+        self.feature_status.set('；'.join(labels))
         self.mode.set('custom' if result['enabled'] else 'default')
         self._mode_changed()
         elapsed = f" · {result['elapsed_seconds']:g} 秒" if 'elapsed_seconds' in result else ''
         self._record(f"检测完成{elapsed} · {self.current.get()}")
         self.notice.set(result.get("reason") or "可保存设置；将在下次从自定义入口启动时生效。")
+        # Detection adds wrapped status/warning lines after the initial layout.
+        # Grow within the screen so those lines do not clip the footer.
+        self.update_idletasks()
+        height = min(self.winfo_reqheight(), self.winfo_screenheight()-100)
+        if height > self.winfo_height():
+            top = min(self.winfo_y(), max(0,self.winfo_screenheight()-height-80))
+            self.geometry(f'{self.winfo_width()}x{height}+{self.winfo_x()}+{top}')
 
     def refresh(self):
         self._run("正在检测官方版本、当前进程与下次启动设置…", self.manager.inspect, self.show_status)
@@ -291,12 +340,26 @@ class App(tk.Tk):
             self.notice.set("请先检测 Codex 桌面安装。")
             return
         try:
-            p = profile(self.max_retries.get(), self.interval.get(), self.jitter.get(),
-                        unit='ms' if self.unit.get() == '毫秒' else 's')
+            timeout = Decimal(self.http_timeout.get())*1000 if self.http_enabled.get() else Decimal(0)
+            if (not timeout.is_finite() or timeout != timeout.to_integral_value()
+                    or (self.http_enabled.get() and timeout<=0)):
+                raise ControllerError('HTTP 响应期限须为 1～600 秒，精度为 1 毫秒。')
+            try:
+                native = profile(self.max_retries.get(), self.interval.get(), self.jitter.get(),
+                                 unit='ms' if self.unit.get() == '毫秒' else 's')
+            except ControllerError:
+                if self.retry_enabled.get():
+                    raise
+                native = self.detected.get('profile') or profile(25,'1')
+            p = profile(native['max_retries'], native['interval_ms'], native.get('jitter_ms',0), unit='ms',
+                        http_timeout_ms=int(timeout),retry_enabled=self.retry_enabled.get())
         except ControllerError as exc:
             self.notice.set(str(exc))
             return
-        self._run("正在制作新副本并验证重试和沙盒，可能需要数分钟；当前进程保持运行…", lambda: self.manager.apply(p), self.changed)
+        except (ArithmeticError,ValueError):
+            self.notice.set('请输入有效的 HTTP 响应期限：1～600 秒，精度为 1 毫秒。')
+            return
+        self._run("正在分别验收所选功能；一项不兼容时保留另一项。超时验收会实际等待一次设定期限…", lambda: self.manager.apply(p), self.changed)
 
     def verify(self):
         if self.path is not None:
@@ -336,11 +399,14 @@ class App(tk.Tk):
         if result.get('cleanup'):
             self.cleaned(result['cleanup'])
         self.version = result.get("version", self.version)
-        title = ("下次启动已切回官方默认" if result["action"] == "restore" else
+        title = ("下次启动已切回官方默认" if result["action"] == "restore" or result.get('enabled') is False else
+                 "已保存可用功能，部分功能待适配" if result.get('degraded') else
                  "设置未变化，已复用有效副本" if result.get('reused') else "新副本已验收并保存到启动入口")
         if not result["changed"]:
             title += "（原本已处于此状态）"
         self._record(title + "；当前运行保持不变。")
+        for warning in result.get('warnings',[]):
+            self._record(warning)
         self.notice.set(title + "。正常退出后从自定义入口启动生效。")
         self.refresh()
 

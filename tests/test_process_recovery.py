@@ -27,8 +27,10 @@ class TemporaryRoot(unittest.TestCase):
 
 
 class NoticeLockTests(TemporaryRoot):
-    def run_launcher(self, mode='custom-trial', existing=True, fail=False):
+    def run_launcher(self, mode='custom-trial', existing=True, fail=False, degraded=False):
         selected = dict(mode=mode, engine=str(self.root / 'copy.exe'), desktop=str(self.root / 'ChatGPT.exe'), reason='fixture')
+        if degraded:
+            selected.update(degraded=True,profile=profile(300,'1.5','.5'),warnings=['HTTP 超时尚未适配，设置已保留。'])
         active = [dict(ProcessId=42, ExecutablePath=r'C:\WindowsApps\OpenAI.Codex_fixture\app\ChatGPT.exe')] if existing else []
         observed = []
         def notification(title, text):
@@ -67,6 +69,9 @@ class NoticeLockTests(TemporaryRoot):
 
     def test_unconfirmed_engine_notice_does_not_hold_lock(self):
         self.assertEqual(self.run_launcher(existing=False), ['试用入口需要检查'])
+
+    def test_partial_feature_notice_does_not_hold_lock(self):
+        self.assertEqual(self.run_launcher(existing=False,degraded=True),['部分功能尚未适配','试用入口需要检查'])
 
     def test_spawn_error_releases_lock(self):
         self.run_launcher(existing=False, fail=True)

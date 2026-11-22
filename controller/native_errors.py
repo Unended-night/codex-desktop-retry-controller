@@ -171,7 +171,7 @@ def invalid_request_layout(ins, name_index, data, off, function, classification)
                 length=add.operands[1].imm+d.operands[1].mem.disp)
 
 
-def name_references(data, regions, targets):
+def name_references(data, regions, targets, *, include_rax=False):
     """Find all candidate LEA RDX,[RIP+rel32] name arguments in one pass.
 
     The Debug-arm proof already requires this ABI argument. Search only its
@@ -179,7 +179,7 @@ def name_references(data, regions, targets):
     exact target checks and full instruction decoding still follow.
     """
     references={target:[] for target in targets}
-    pattern=re.compile(rb'[\x48-\x4b]\x8d\x15')
+    pattern=re.compile(rb'[\x48-\x4b]\x8d[\x05\x15]' if include_rax else rb'[\x48-\x4b]\x8d\x15')
     for start,end,address in regions:
         for match in pattern.finditer(data,start,end):
             at=match.start()
@@ -201,14 +201,17 @@ def locate_invalid_request(data, s, function, off, va, cs, regions):
     # slice length and enum/formatter flow below, not a trailing byte, prove
     # that this is the InvalidRequest variant rather than an SDK name prefix.
     targets={va(match.start()) for match in re.finditer(rb'InvalidRequest',data)}
-    for offsets in name_references(data,regions,targets).values():
+    delegated = classification.get('delegated',False)
+    for offsets in name_references(data,regions,targets,include_rax=delegated).values():
         for at in offsets:
             try:
                 _,ins=function(at)
                 n=next(n for n,i in enumerate(ins) if i.address==va(at)
-                       and i.mnemonic=='lea' and i.reg_name(i.operands[0].reg)=='rdx')
+                       and i.mnemonic=='lea' and i.reg_name(i.operands[0].reg) in (('rdx','rax') if delegated else ('rdx',)))
                 if 'returned_classifier' in s:
-                    from .native_return import invalid_request_layout as byte_layout
+                    from .native_return import invalid_request_layout as byte_layout, direct_invalid_request_layout
+                    if ins[n].reg_name(ins[n].operands[0].reg)=='rax':
+                        byte_layout = direct_invalid_request_layout
                     result=byte_layout(ins,n,data,off,cs,classification)
                 else:
                     result=invalid_request_layout(ins,n,data,off,function,classification)
@@ -219,7 +222,7 @@ def locate_invalid_request(data, s, function, off, va, cs, regions):
     return only(results,'InvalidRequest layout')
 
 
-def error_policy(s, p):
+def error_policy(s, p, *, address=None):
     """Leaf helper: preserve native classification, then check two JSON fields.
 
     Never calls another function or touches the stack/nonvolatile registers.
@@ -303,6 +306,14 @@ def error_policy(s, p):
         c.relative('e9','delay')
         c.label(name+'advance');c.emit('49ffc2');c.relative('e9',name+'scan')
     compare = b'\x81\xfa'+struct.pack('<I',s['none_value']) if returned else b''
-    c.label('return');c.emit(compare);c.emit('c3')
-    c.label('delay');c.emit(delay_code(p));c.emit(compare);c.emit('c3')
+    def finish():
+        c.emit(compare)
+        if address is not None and 'policy_present' in s:
+            from .native_v4 import jmp
+            c.emit(jmp(address+len(c.data),s['policy_absent'],b'\x0f\x84'))
+            c.emit(jmp(address+len(c.data),s['policy_present']))
+        else:
+            c.emit('c3')
+    c.label('return');finish()
+    c.label('delay');c.emit(delay_code(p));finish()
     return c.finish()

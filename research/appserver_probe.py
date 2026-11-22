@@ -65,8 +65,12 @@ def run(exe, directory, env, timeout, *, compact=False):
         else:
             timed_out = True
     finally:
+        proc.stdin.close()
         if proc.poll() is None:
-            proc.terminate()
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
         proc.wait(timeout=10)
         for thread in threads:
             thread.join(timeout=5)

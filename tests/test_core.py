@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from controller.core import ControllerError, b64, profile, recover_baseline, sha
+from controller.core import ControllerError, Manager, b64, profile, recover_baseline, sha
 from controller.core import exclusive_binary, version_of, validate_profile, profile_label
 
 
@@ -72,6 +72,19 @@ class Undo(unittest.TestCase):
 
 
 class FileSafety(unittest.TestCase):
+    def test_native_api_refuses_desktop_only_options_before_verification_or_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager(Path(directory))
+            try:
+                with patch.object(manager, 'verify') as verify, patch.object(manager, '_change') as change:
+                    for options in ({'retry_enabled':False}, {'http_timeout_ms':1000}):
+                        with self.subTest(options=options), self.assertRaisesRegex(ControllerError, '桌面控制器'):
+                            manager.apply(Path(directory)/'untouched.exe', profile(3,'1',**options))
+                    verify.assert_not_called()
+                    change.assert_not_called()
+            finally:
+                manager.close()
+
     def test_unknown_build_refused(self):
         with self.assertRaises(ControllerError):
             version_of(b"MZ-not-the-verified-engine")

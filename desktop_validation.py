@@ -41,9 +41,12 @@ def configuration_notes(path):
     return notes
 
 
-def rules_id():
+def rules_id(*, legacy=False):
     paths = ['desktop_runtime.py', 'desktop_trial.py', 'desktop_validation.py', 'desktop_storage.py', 'desktop_processes.py',
              'research/verify_desktop_runtime.py', 'tests/verify_reported_rate_limit.py']
+    if legacy:
+        paths += ['transport_runtime.py','transport_guard.py','transport_bridge.py','transport_runner.py',
+                  'transport_shim.cs','transport_validation.py','requirements.txt']
     return sha(b''.join(name.encode() + b'\0' + (ROOT / name).read_bytes() for name in paths))
 
 
@@ -134,35 +137,61 @@ def receipt_valid(report, manifest):
         version = manifest.get('format')
         if version == 2:
             config_record_valid = report['config_sha256'] == manifest['config_sha256']
-        elif version == 3:
+        elif version in (3,4,5):
             config_record_valid = report.get('config_policy') == manifest.get('config_policy') == 'user-managed'
         else:
             return False
-        return (report.get('format') == version and config_record_valid and report.get('trial_eligible') is True
+        guard_valid = not manifest['profile'].get('http_timeout_ms') and version != 4
+        if version == 4:
+            from transport_validation import valid
+            from transport_runtime import FILES
+            files=manifest.get('guard_files')
+            guard_valid = (isinstance(files,dict) and set(files)==set(FILES)
+                           and all(isinstance(value,str) and len(value)==64 for value in files.values())
+                           and isinstance(manifest.get('guard_dependencies'),dict)
+                           and report.get('guard_files') == files
+                           and report.get('guard_dependencies') == manifest.get('guard_dependencies')
+                           and valid(report.get('http_timeout',{}),manifest['profile']))
+        native_enabled = manifest['profile'].get('retry_enabled', True)
+        if native_enabled:
+            retry_valid = (check_retry(report['retry'], manifest['profile'])
+                           and (not manifest.get('supports_retry_scope') or
+                                scope_results_valid(report.get('retry_scope',[]),manifest['profile'])))
+        else:
+            # A timeout-only entry must run the byte-identical official engine.
+            retry_valid = (version == 5 and report.get('retry') is None
+                           and report.get('retry_scope') == []
+                           and manifest.get('supports_retry_scope') is False
+                           and manifest['recipe_sha256'] is None
+                           and manifest['runtime_files'] == manifest['official_files'])
+        return (report.get('format') == version and config_record_valid and guard_valid and report.get('trial_eligible') is True
                 and report['profile'] == manifest['profile']
                 and report['engine_sha256'] == manifest['runtime_files']['codex.exe']
                 and report['official_files'] == manifest['official_files']
                 and report['recipe_sha256'] == manifest['recipe_sha256']
                 and report['desktop_rules_sha256'] == manifest['desktop_rules_sha256']
-                and check_retry(report['retry'], manifest['profile'])
-                and (not manifest.get('supports_retry_scope') or
-                     scope_results_valid(report.get('retry_scope',[]),manifest['profile']))
+                and retry_valid
                 and sandbox_valid(report['comparisons']))
     except (KeyError, TypeError, ValueError, AttributeError):
         return False
 
 
-def run(resources, target, manifest):
+def run(resources, target, manifest, *, entry=None, work_name=None):
     # Called under python.exe, including when the UI itself runs under pythonw.
     from research.verify_desktop_runtime import sandbox_matrix, replay
     work = target / 'validation-work'
-    work.mkdir()
+    if work_name:
+        work /= work_name
+    work.mkdir(parents=True)
     p = manifest['profile']
-    retry = replay(target / 'codex.exe', work / 'retry',
-                   stop_after=2 if p['max_retries'] > 2 else None,
-                   timeout=45 + 2 * (p['interval_ms']+p.get('jitter_ms', 0)) / 1000)
-    if not check_retry(retry, p):
-        raise ControllerError(f'新参数的重试次数或实际等待时间未通过验收：{retry}')
+    entry = entry or target / ('codex-guard.exe' if p.get('http_timeout_ms') else 'codex.exe')
+    retry = None
+    if p.get('retry_enabled', True):
+        retry = replay(entry, work / 'retry',
+                       stop_after=2 if p['max_retries'] > 2 else None,
+                       timeout=45 + 2 * (p['interval_ms']+p.get('jitter_ms', 0)) / 1000)
+        if not check_retry(retry, p):
+            raise ControllerError(f'新参数的重试次数或实际等待时间未通过验收：{retry}')
     scope=[]
     if manifest.get('supports_retry_scope'):
         import sys
@@ -178,7 +207,7 @@ def run(resources, target, manifest):
                       error_message=RESPONSES_BAD_REQUEST_PREFIX+MASKED_RESOURCE_MESSAGE+' [hub-] [trace_id=local-parameters]')]
         def run_probe(item):
             name,option=item
-            result=probe(str(target/'codex.exe'),4,stream_retries=5,interface='app-server',
+            result=probe(str(entry),4,stream_retries=5,interface='app-server',
                          succeed=p['max_retries']>2,stop_after=2 if p['max_retries']>2 else 4,
                          timeout=45+2*(p['interval_ms']+p.get('jitter_ms',0))/1000,**option)
             return dict(name=name,result=result)
@@ -190,10 +219,15 @@ def run(resources, target, manifest):
         if not scope_results_valid(scope,p):
             raise ControllerError('新参数的两类错误或压缩重试验收失败，未切换入口。')
     matrices = [sandbox_matrix(resources / 'codex.exe', work, 'official'),
-                sandbox_matrix(target / 'codex.exe', work, 'copy')]
+                sandbox_matrix(entry, work, 'copy')]
     if not sandbox_valid(matrices):
         raise ControllerError('原版与副本的 unelevated 沙盒对照未通过；详见本次验证日志。')
-    return dict(format=3, config_policy='user-managed', trial_eligible=True, profile=p,
+    extra = {}
+    if p.get('http_timeout_ms'):
+        from transport_validation import run as verify_timeout
+        extra = dict(http_timeout=verify_timeout(target,work,p),guard_files=manifest['guard_files'],
+                     guard_dependencies=manifest['guard_dependencies'])
+    return dict(format=manifest.get('format',3), config_policy='user-managed', trial_eligible=True, profile=p,**extra,
                 engine_sha256=manifest['runtime_files']['codex.exe'],
                 official_files=manifest['official_files'],
                 recipe_sha256=manifest['recipe_sha256'], desktop_rules_sha256=manifest['desktop_rules_sha256'],

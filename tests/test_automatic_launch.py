@@ -7,13 +7,13 @@ import desktop_runtime as runtime
 
 
 class AutomaticLaunchTests(unittest.TestCase):
-    def launch(self,args,enabled=True,mode='official'):
+    def launch(self,args,enabled=True,mode='official',degraded=False):
         manager=MagicMock()
         manager._worker.return_value={'changed':True}
         with patch.object(runtime,'operation_lock',side_effect=lambda root, *args:contextlib.nullcontext()), \
              patch.object(runtime,'read_pointer',return_value=dict(enabled=enabled,runtime='old')), \
              patch.object(runtime,'DesktopManager',return_value=manager), \
-             patch.object(launcher,'get_selection',return_value=dict(mode=mode)), \
+             patch.object(launcher,'get_selection',return_value=dict(mode=mode,degraded=degraded)), \
              patch.object(launcher,'process_snapshot',return_value=[]), \
              patch.object(launcher,'automatic_update',side_effect=lambda m:m._worker('auto')), \
              patch.object(launcher,'_main',return_value=2) as actual:
@@ -32,6 +32,11 @@ class AutomaticLaunchTests(unittest.TestCase):
             with self.subTest(args=args,enabled=enabled,mode=mode):
                 manager,_=self.launch(args,enabled,mode)
                 manager._worker.assert_not_called()
+
+    def test_partial_entry_still_attempts_missing_feature_before_launch(self):
+        manager,actual=self.launch([],mode='custom-trial',degraded=True)
+        manager._worker.assert_called_once_with('auto')
+        actual.assert_called_once_with([],{'changed':True},notifications=[])
 
 
 if __name__=='__main__': unittest.main()

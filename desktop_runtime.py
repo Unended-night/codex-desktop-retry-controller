@@ -14,7 +14,8 @@ import threading
 import time
 import traceback
 
-from controller.core import ROOT, ControllerError, Manager, atomic_json, now, profile, profile_label, validate_profile
+from controller.core import (ROOT, ControllerError, Manager, atomic_json, now, profile, profile_label,
+                             retry_profile, validate_profile, version_of)
 from controller.verification import cache_path, recipe_id
 import desktop_trial as launcher
 import desktop_validation as validation
@@ -96,16 +97,28 @@ def snapshot(resources):
                 recipe_sha256=recipe_id(), desktop_rules_sha256=validation.rules_id())
 
 
+def adaptation_identity(build, p):
+    identity = dict(build=build, profile=p)
+    if p.get('http_timeout_ms'):
+        try:
+            from transport_runtime import dependency_identity, rules_id as guard_rules_id
+            identity['http_timeout'] = dict(rules=guard_rules_id(), dependencies=dependency_identity())
+        except Exception as exc:
+            # Missing optional dependencies must not prevent a native update.
+            identity['http_timeout'] = dict(error=type(exc).__name__ + ': ' + str(exc))
+    return identity
+
+
 def publish(root, p, config, resources_getter=launcher.installed_resources):
     """Caller holds desktop lock. Never writes source files or a previous runtime."""
     p = validate_profile(p)
     resources = resources_getter().resolve(strict=True)
     before = snapshot(resources)
+    identity = adaptation_identity(before, p)
     previous = read_pointer(root)
     owner = Manager(root)
     target = None
     try:
-        approval = owner.verify(resources / 'codex.exe')
         runtime_root = root / 'runtime'
         runtime_root.mkdir(parents=True, exist_ok=True)
         target = Path(tempfile.mkdtemp(prefix=before['official_files']['codex.exe'][:12] + '-', dir=runtime_root))
@@ -114,26 +127,68 @@ def publish(root, p, config, resources_getter=launcher.installed_resources):
             shutil.copyfile(resources / name, target / name)
             if launcher.digest(target / name) != before['official_files'][name]:
                 raise ControllerError('复制期间官方组件发生变化，请重新检测。')
-        patcher = Manager(target / 'controller-state')
         try:
-            atomic_json(cache_path(patcher, (target / 'codex.exe').read_bytes()), approval)
-            patcher.apply(target / 'codex.exe', p)
-        finally:
-            patcher.close()
-        manifest = dict(before, format=3, config_policy='user-managed',
-                        supports_retry_scope=approval.get('supports_retry_scope',False),
-                        created_at=now(), version=approval['version'], profile=p,
+            version = version_of((target / 'codex.exe').read_bytes())
+        except ControllerError:
+            version = '未识别'
+        manifest = dict(before, format=5, config_policy='user-managed', supports_retry_scope=False,
+                        created_at=now(), version=version, profile=retry_profile(p), requested_profile=p,
                         desktop_exe=str(resources.parent / 'ChatGPT.exe'), activation='not-approved',
-                        runtime_files={n: launcher.digest(target / n) for n in validation.COMPONENTS})
-        atomic_json(target / 'manifest.json', manifest)
-        report = validation.run(resources, target, manifest)
+                        runtime_files=dict(before['official_files']), feature_errors={})
+
+        def official_base():
+            # A failed native preparation may have partially patched its own
+            # candidate. Timeout-only starts from verified official bytes.
+            shutil.copyfile(resources / 'codex.exe', target / 'codex.exe')
+            if launcher.digest(target / 'codex.exe') != before['official_files']['codex.exe']:
+                raise ControllerError('准备原生引擎期间官方文件变化，未切换入口。')
+            manifest.update(profile=validate_profile(dict(retry_profile(p), retry_enabled=False)),
+                            recipe_sha256=None, supports_retry_scope=False,
+                            runtime_files={n: launcher.digest(target / n) for n in validation.COMPONENTS})
+            return validation.run(resources, target, manifest, work_name='official')
+
+        if p.get('retry_enabled', True):
+            try:
+                approval = owner.verify(resources / 'codex.exe')
+                patcher = Manager(target / 'controller-state')
+                try:
+                    atomic_json(cache_path(patcher, (target / 'codex.exe').read_bytes()), approval)
+                    patcher.apply(target / 'codex.exe', retry_profile(p))
+                finally:
+                    patcher.close()
+                manifest.update(version=approval['version'], supports_retry_scope=approval.get('supports_retry_scope',False),
+                                runtime_files={n: launcher.digest(target / n) for n in validation.COMPONENTS})
+                report = validation.run(resources, target, manifest, work_name='retry')
+                if not validation.receipt_valid(report, manifest):
+                    raise ControllerError('自定义重试独立验收报告不完整。')
+            except Exception as exc:
+                if not p.get('http_timeout_ms'):
+                    raise
+                manifest['feature_errors']['retry'] = str(exc)
+                owner.logger.exception('Custom retries unavailable; validating timeout-only candidate')
+                report = official_base()
+        else:
+            report = official_base()
         if not validation.receipt_valid(report, manifest):
             raise ControllerError('验证报告不完整；未切换入口。')
         atomic_json(target / 'validation.json', report)
-        if before != snapshot(resources_getter().resolve(strict=True)):
+        manifest['validation_sha256'] = launcher.digest(target / 'validation.json')
+        if p.get('http_timeout_ms'):
+            try:
+                from transport_runtime import prepare as prepare_timeout
+                manifest['http_timeout'] = prepare_timeout(resources, target, manifest, p['http_timeout_ms'])
+            except Exception as exc:
+                manifest['feature_errors']['http_timeout'] = str(exc)
+                owner.logger.exception('HTTP timeout unavailable; retaining independently verified retry entry')
+        if not manifest['profile'].get('retry_enabled', True) and not manifest.get('http_timeout'):
+            raise ControllerError('请求的功能均未通过独立验收；旧入口保留。\n' +
+                                  '\n'.join(f'{key}: {value}' for key,value in manifest['feature_errors'].items()))
+        after = snapshot(resources_getter().resolve(strict=True))
+        if not manifest['profile'].get('retry_enabled', True):
+            after['recipe_sha256'] = before['recipe_sha256']
+        if before != after:
             raise ControllerError('验证期间官方安装或规则发生变化；未切换入口，请重新检测。')
         manifest.update(activation='app-server-tested-desktop-trial',
-                        validation_sha256=launcher.digest(target / 'validation.json'),
                         scope=report['scope'])
         atomic_json(target / 'manifest.json', manifest)
         selected = launcher.selection(resources, target, manifest, config, recipe_id())
@@ -144,8 +199,21 @@ def publish(root, p, config, resources_getter=launcher.installed_resources):
         # The only activation write. A failed/crashed preparation leaves the old pointer intact.
         atomic_json(root / 'state/desktop-trial.json', dict(runtime=str(target), enabled=True,
                     last_profile=p, created_at=now()))
-        return dict(action='apply', changed=True, profile=p, version=approval['version'],
+        result = dict(action='apply', changed=True, profile=p, effective_profile=selected['profile'],
+                    degraded=selected.get('degraded',False), warnings=selected.get('warnings',[]),
+                    features=selected.get('features',{}), version=manifest['version'],
                     runtime=str(target), validation=str(target / 'validation.json'))
+        if result['degraded']:
+            # Manual partial success also defers the same failed optional layer;
+            # the next launch should not immediately repeat minutes of tests.
+            record = dict(identity=identity, passed=False, completed_at=now(), result=result,
+                          retry_after=time.time()+6*3600, reason='；'.join(result['warnings']))
+            try:
+                atomic_json(root / 'state/automatic-update.json', record)
+                atomic_json(root / 'logs/automatic-update.json', record)
+            except OSError:
+                owner.logger.exception('Published partial runtime; could not record automatic retry cooldown')
+        return result
     except Exception:
         owner.logger.exception('Desktop runtime preparation failed; candidate=%s', target)
         from desktop_storage import best_effort
@@ -169,9 +237,15 @@ def restore(root):
 def prepare(root, p, config, *, force=False):
     """Reuse only a currently selected, fully validated matching generation."""
     p = validate_profile(p)
+    if not p.get('retry_enabled',True) and not p.get('http_timeout_ms'):
+        pointer=read_pointer(root)
+        changed=pointer.get('enabled',True) is not False or saved_profile(root)!=p
+        pointer.update(enabled=False,last_profile=p,updated_at=now())
+        atomic_json(root/'state/desktop-trial.json',pointer)
+        return dict(action='apply',changed=changed,enabled=False,profile=p,effective_profile=p,degraded=False,warnings=[])
     if not force:
         selected = launcher.get_selection(root, config_path=config)
-        if selected['mode'] == 'custom-trial' and selected['profile'] == p:
+        if selected['mode'] == 'custom-trial' and selected['profile'] == p and not selected.get('degraded'):
             target = Path(selected['engine']).parent
             manifest = runtime_manifest(root, target)[1]
             return dict(action='apply', changed=False, reused=True, profile=p,
@@ -192,11 +266,11 @@ def auto_prepare(root, config):
     if launcher.running_desktops(launcher.process_snapshot()):
         return dict(action='auto', changed=False, reason='桌面正在运行，等待下次启动。')
     selected = launcher.get_selection(root, config_path=config)
-    if selected['mode'] == 'custom-trial':
+    if selected['mode'] == 'custom-trial' and not selected.get('degraded'):
         return dict(action='auto', changed=False, reused=True)
     p = saved_profile(root)
     resources = launcher.installed_resources().resolve(strict=True)
-    identity = dict(build=snapshot(resources), profile=p)
+    identity = adaptation_identity(snapshot(resources), p)
     cache = root / 'state/automatic-update.json'
     try:
         previous = json.loads(cache.read_text(encoding='utf-8'))
@@ -207,7 +281,8 @@ def auto_prepare(root, config):
             and isinstance(previous.get('retry_after'), (int, float))
             and time.time() < previous['retry_after']):
         return dict(action='auto', changed=False, deferred=True,
-                    reason='上次自动适配未通过，暂用官方引擎；可在控制器立即重新验证。',
+                    degraded=selected.get('degraded',False),
+                    reason='上次有功能未通过适配，本次保留已验收功能；可在控制器立即重新验证。',
                     detail=previous.get('reason'))
     started = time.time()
     atomic_json(cache, dict(identity=identity, passed=False, attempted_at=now(),
@@ -220,8 +295,11 @@ def auto_prepare(root, config):
         atomic_json(cache, record)
         atomic_json(root / 'logs/automatic-update.json', record)
         return dict(action='auto', changed=False, reason='自动适配未通过：'+str(exc))
-    atomic_json(cache, dict(identity=identity, passed=True, completed_at=now(), result=result))
-    atomic_json(root / 'logs/automatic-update.json', dict(passed=True, completed_at=now(), result=result))
+    record=dict(identity=identity,passed=not result.get('degraded'),completed_at=now(),result=result)
+    if result.get('degraded'):
+        record.update(retry_after=time.time()+6*3600,reason='；'.join(result.get('warnings',[])))
+    atomic_json(cache, record)
+    atomic_json(root / 'logs/automatic-update.json', record)
     return dict(result, action='auto')
 
 
@@ -237,8 +315,7 @@ def python_console():
 def running_state(root, processes, selected):
     desktops = launcher.running_desktops(processes)
     ids = {p['ProcessId'] for p in desktops}
-    engines = [p for p in processes if p.get('ParentProcessId') in ids
-               and Path(p.get('ExecutablePath') or '').name.lower() == 'codex.exe']
+    engines = launcher.desktop_engines(processes,ids)
     if not desktops:
         return '当前运行：未启动 Codex 桌面', False
     if not engines:
@@ -248,11 +325,17 @@ def running_state(root, processes, selected):
         exe = Path(process['ExecutablePath']).resolve()
         try:
             _, manifest = runtime_manifest(root, exe.parent)
-            p = validate_profile(manifest['profile'])
+            p = retry_profile(manifest['profile'])
             if launcher.digest(exe) != manifest['runtime_files']['codex.exe']:
                 raise ValueError('hash')
+            entry=Path(process.get('ControllerEntryPath',str(exe))).resolve()
+            if entry == exe.with_name('codex-guard.exe'):
+                timeout=(manifest.get('http_timeout') or {}).get('timeout_ms') if manifest.get('format')==5 else manifest['profile'].get('http_timeout_ms')
+                if timeout:
+                    p=validate_profile(dict(p,http_timeout_ms=timeout))
             labels.append(profile_label(p))
-            matches.append(selected['mode'] == 'custom-trial' and exe == Path(selected['engine']).resolve())
+            matches.append(selected['mode'] == 'custom-trial' and exe == Path(selected['engine']).resolve()
+                           and entry == Path(selected.get('cli',selected['engine'])).resolve())
         except (OSError, ValueError, KeyError, TypeError, ControllerError):
             # A path outside managed runtime is only called official after hashing it.
             official = Path(selected['desktop']).parent / 'resources/codex.exe'
@@ -303,16 +386,19 @@ class DesktopManager:
             next_text = f"下次启动：自动适配 {profile_label(p)}（验收失败则使用官方）"
         if pending:
             next_text += '（待正常退出后从自定义入口启动）'
-        reason = (native.get('reason') if not native['compatible'] else '') or selected['reason']
+        reason = selected['reason'] if custom else (native.get('reason') if not native['compatible'] else '') or selected['reason']
         if custom and pending is False and current != '当前运行：未启动 Codex 桌面':
             reason = reason.replace('首次桌面引擎选择待确认', '当前桌面已确认选中此副本')
         notes = selected.get('config_notes', [])
         if notes:
             reason += '\n范围提示（不拦截启动）：' + '；'.join(notes)
         return dict(native, status='custom' if custom else 'default', profile=p,
-                    enabled=enabled, compatible=native['compatible'],
+                    enabled=enabled, compatible=custom or native['compatible'],
+                    verified=custom or native.get('verified',False),
+                    retry_compatible=native['compatible'], retry_verified=native.get('verified',False),
                     can_restore=True, current_text=current, next_text=next_text,
-                    selected=selected, pending_restart=pending, reason=reason)
+                    selected=selected, pending_restart=pending, reason=reason,
+                    features=selected.get('features',{}),degraded=selected.get('degraded',False))
 
     def _worker(self, action, p=None, *, extra=()):
         from desktop_processes import CANCELLED, run_worker
@@ -327,6 +413,9 @@ class DesktopManager:
             p = validate_profile(p)
             command += ['--retries', str(p['max_retries']), '--interval-ms', str(p['interval_ms']),
                         '--jitter-ms', str(p.get('jitter_ms', 0))]
+            command += ['--http-timeout-ms', str(p.get('http_timeout_ms',0))]
+            if not p.get('retry_enabled',True):
+                command += ['--no-custom-retry']
         command += list(extra)
         # Pipe native probe output to a file; pythonw has no reliable stdout.
         with output.with_suffix('.log').open('w', encoding='utf-8') as log:
@@ -389,7 +478,11 @@ def main():
     units = parser.add_mutually_exclusive_group()
     units.add_argument('--interval', help='基础等待秒数，支持三位小数')
     units.add_argument('--interval-ms', help='基础等待毫秒数')
-    parser.add_argument('--jitter-ms', default='0', help='对称随机扰动毫秒数，0 表示固定等待')
+    parser.add_argument('--jitter-ms', help='对称随机扰动毫秒数，0 表示固定等待')
+    parser.add_argument('--http-timeout-ms', type=int, default=0,
+                        help='HTTP 上传/响应头及非流式正文的各阶段期限，1000～600000 毫秒；0 关闭')
+    parser.add_argument('--no-custom-retry', action='store_true',
+                        help='保留原生重试次数与等待；可单独启用 HTTP 超时')
     parser.add_argument('--root', type=Path, default=ROOT)
     parser.add_argument('--config', type=Path, default=config_path())
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
@@ -397,10 +490,18 @@ def main():
     parser.add_argument('--job-gate', help=argparse.SUPPRESS)
     args = parser.parse_args()
     def requested_profile():
+        stored = saved_profile(args.root) if args.no_custom_retry else {}
+        count = args.retries if args.retries is not None else stored.get('max_retries')
+        jitter = args.jitter_ms if args.jitter_ms is not None else stored.get('jitter_ms',0)
+        if args.no_custom_retry and args.interval_ms is None and args.interval is None:
+            return profile(count, stored['interval_ms'], jitter, unit='ms',
+                           http_timeout_ms=args.http_timeout_ms, retry_enabled=False)
         if args.interval_ms is not None:
-            return profile(args.retries, args.interval_ms, args.jitter_ms, unit='ms')
-        base = profile(args.retries, args.interval)
-        return profile(args.retries, base['interval_ms'], args.jitter_ms, unit='ms')
+            return profile(count, args.interval_ms, jitter, unit='ms',
+                           http_timeout_ms=args.http_timeout_ms,retry_enabled=not args.no_custom_retry)
+        base = profile(count, args.interval)
+        return profile(count, base['interval_ms'], jitter, unit='ms',
+                       http_timeout_ms=args.http_timeout_ms,retry_enabled=not args.no_custom_retry)
     from desktop_processes import wait_worker_gate
     wait_worker_gate(args.job_gate)
     manager = DesktopManager(args.root, config=args.config)

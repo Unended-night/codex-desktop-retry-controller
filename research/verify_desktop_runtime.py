@@ -112,7 +112,10 @@ class Rpc:
         self.proc.stdin.flush()
 
     def close(self):
-        if self.proc.poll() is None: self.proc.terminate()
+        self.proc.stdin.close()
+        if self.proc.poll() is None:
+            try:self.proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:self.proc.terminate()
         self.proc.wait(timeout=10)
         for reader in self.readers: reader.join(timeout=3)
         for pipe in (self.proc.stdin, self.proc.stdout, self.proc.stderr): pipe.close()

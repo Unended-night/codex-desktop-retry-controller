@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 
-from controller.core import ControllerError
+from controller.core import ControllerError, profile_label
 
 ROOT = Path(__file__).resolve().parent
 
@@ -58,7 +58,13 @@ def selection(resources, runtime, manifest, config_path, expected_recipe):
             return reject('官方桌面已更新，尚未验收新版本副本。')
         if digest(resources.parent/'ChatGPT.exe')!=manifest['desktop_sha256'] or digest(resources/'app.asar')!=manifest['app_asar_sha256']:
             return reject('官方桌面构建发生变化。')
-        if manifest['recipe_sha256']!=expected_recipe:
+        from controller.core import validate_profile, profile_label
+        p = validate_profile(manifest['profile'])
+        version = manifest.get('format',1)
+        if version != 5 and not p.get('retry_enabled',True):
+            return reject('旧副本记录没有独立关闭自定义重试的验收。')
+        if ((version != 5 or p.get('retry_enabled',True))
+                and manifest['recipe_sha256']!=expected_recipe):
             return reject('控制器规则已变化，需要重新验收。')
         required={'codex.exe','codex-code-mode-host.exe','codex-command-runner.exe','codex-windows-sandbox-setup.exe','rg.exe'}
         if set(manifest['official_files'])!=required or set(manifest['runtime_files'])!=required:
@@ -73,20 +79,65 @@ def selection(resources, runtime, manifest, config_path, expected_recipe):
         validation=json.loads((runtime/'validation.json').read_text(encoding='utf-8'))
         if not validation.get('trial_eligible'):
             return reject('验证报告没有批准试用。')
-        from controller.core import validate_profile, profile_label
-        p = validate_profile(manifest['profile'])
-        if manifest.get('format', 1) in (2, 3):
+        if version in (2,3,4,5):
             from desktop_validation import rules_id, receipt_valid
-            if manifest.get('desktop_rules_sha256') != rules_id() or not receipt_valid(validation, manifest):
+            if manifest.get('desktop_rules_sha256') != rules_id(legacy=version!=5) or not receipt_valid(validation, manifest):
                 return reject('桌面验证规则或参数验收记录不匹配，请在控制器重新验证。')
         elif manifest.get('format', 1) != 1:
             return reject('副本记录格式不受支持。')
         desktop_status=('首次桌面引擎选择已确认' if manifest.get('desktop_launch_confirmed_at')
                         else '首次桌面引擎选择待确认')
         from desktop_validation import configuration_notes
-        return dict(mode='custom-trial',engine=str(runtime/'codex.exe'),desktop=fallback['desktop'],
+        extra = {}
+        if version == 5:
+            requested = validate_profile(manifest['requested_profile'])
+            errors = dict(manifest.get('feature_errors',{}))
+            active_retry = p.get('retry_enabled',True)
+            wanted_retry = requested.get('retry_enabled',True)
+            if active_retry and not wanted_retry:
+                return reject('基础引擎的重试开关与保存设置不一致。')
+            if requested.get('http_timeout_ms'):
+                try:
+                    if not manifest.get('http_timeout'):
+                        raise ControllerError(errors.get('http_timeout','尚未通过独立验收。'))
+                    from transport_runtime import checked_profile
+                    p = checked_profile(runtime,manifest)
+                    extra['cli'] = str(runtime/'codex-guard.exe')
+                except Exception as exc:
+                    # The base engine and its own receipt are already verified.
+                    # An optional import/dependency/protocol failure stays here.
+                    errors['http_timeout'] = str(exc)
+            features={
+                'retry': dict(requested=wanted_retry,enabled=active_retry),
+                'http_timeout': dict(requested=bool(requested.get('http_timeout_ms')),
+                                     enabled=bool(p.get('http_timeout_ms'))),
+            }
+            warnings=[]
+            for name,label in (('retry','自定义重试'),('http_timeout','HTTP 超时')):
+                item=features[name]
+                item['state']='ready' if item['enabled'] else 'unavailable' if item['requested'] else 'disabled'
+                if item['state']=='unavailable':
+                    item['reason']=errors.get(name,'尚未通过独立验收。')
+                    detail=str(item['reason'] or '独立验收未完成').splitlines()[0][:240]
+                    warnings.append(f'{label}未启用：{detail}。设置已保留，可在控制器重新验证；仍不兼容时需要更新适配。')
+            if not active_retry and not p.get('http_timeout_ms'):
+                return dict(fallback,reason='；'.join(warnings) or '两项自定义功能均已关闭。',
+                            features=features,warnings=warnings,degraded=bool(warnings),requested_profile=requested)
+            extra.update(features=features,warnings=warnings,degraded=bool(warnings),requested_profile=requested)
+        elif manifest.get('format') == 4:
+            from transport_runtime import valid, dependency_identity
+            if (not p.get('http_timeout_ms') or not valid(runtime,manifest.get('guard_files'))
+                    or dependency_identity() != manifest.get('guard_dependencies')):
+                return reject('HTTP 超时组件或依赖发生变化，需要重新验收。')
+            extra['cli'] = str(runtime/'codex-guard.exe')
+        elif p.get('http_timeout_ms'):
+            return reject('此副本缺少 HTTP 超时验收。')
+        reason=profile_label(p)+'；app-server 与 unelevated 沙盒对照已通过；'+desktop_status+'。'
+        if extra.get('warnings'):
+            reason+='\n'+'\n'.join(extra['warnings'])
+        return dict(mode='custom-trial',engine=str(runtime/'codex.exe'),desktop=fallback['desktop'],**extra,
                     config_notes=configuration_notes(config_path),
-                    profile=p, reason=profile_label(p)+'；app-server 与 unelevated 沙盒对照已通过；'+desktop_status+'。')
+                    profile=p, reason=reason)
     except (OSError,ValueError,KeyError,TypeError,AttributeError,ControllerError):
         return reject('副本文件或记录不可用。')
 
@@ -96,13 +147,13 @@ def launch_environment(base, selected):
     # Electron inherits this from some terminal hosts; leaving it set starts Node.
     env.pop('ELECTRON_RUN_AS_NODE',None)
     env.pop('CODEX_CLI_PATH',None)
-    if selected['mode']=='custom-trial':env['CODEX_CLI_PATH']=selected['engine']
+    if selected['mode']=='custom-trial':env['CODEX_CLI_PATH']=selected.get('cli',selected['engine'])
     return env
 
 
 def process_snapshot():
     script="""[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new();
-@(Get-CimInstance Win32_Process -Filter \"Name = 'ChatGPT.exe' OR Name = 'codex.exe'\" |
+@(Get-CimInstance Win32_Process -Filter \"Name = 'ChatGPT.exe' OR Name = 'codex.exe' OR Name = 'codex-guard.exe' OR Name = 'python.exe'\" |
 Select-Object ProcessId,ParentProcessId,ExecutablePath) | ConvertTo-Json -Compress"""
     result=subprocess.run([str(Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0/powershell.exe'),
         '-NoLogo','-NoProfile','-NonInteractive','-Command',script],capture_output=True,encoding='utf-8',
@@ -114,6 +165,29 @@ Select-Object ProcessId,ParentProcessId,ExecutablePath) | ConvertTo-Json -Compre
 def running_desktops(processes):
     return [p for p in processes if Path(p.get('ExecutablePath') or '').name.lower()=='chatgpt.exe'
             and 'openai.codex_' in (p.get('ExecutablePath') or '').lower()]
+
+
+def desktop_engines(processes, desktop_ids):
+    """Follow the short owned shim/Python chain as well as a direct child."""
+    by_id={p['ProcessId']:p for p in processes}
+    result=[]
+    for row in processes:
+        if Path(row.get('ExecutablePath') or '').name.lower()!='codex.exe':
+            continue
+        parent=row.get('ParentProcessId')
+        entry=row['ExecutablePath']
+        visited=set()
+        while parent not in desktop_ids and parent in by_id and parent not in visited:
+            visited.add(parent)
+            ancestor=by_id[parent]
+            if Path(ancestor.get('ExecutablePath') or '').name.lower() not in ('codex-guard.exe','python.exe'):
+                break
+            if Path(ancestor.get('ExecutablePath') or '').name.lower()=='codex-guard.exe':
+                entry=ancestor['ExecutablePath']
+            parent=ancestor.get('ParentProcessId')
+        if parent in desktop_ids:
+            result.append(dict(row,ControllerEntryPath=entry))
+    return result
 
 
 def save_status(name, status):
@@ -170,7 +244,7 @@ def automatic_update(manager):
     window=tk.Tk()
     window.title('Codex 更新适配')
     window.resizable(False,False)
-    ttk.Label(window,text='正在为新版准备已保存的重试设置…',padding=(24,18)).pack()
+    ttk.Label(window,text='正在分别验收已保存的重试与超时设置…',padding=(24,18)).pack()
     ttk.Label(window,text='首次验收可能需要数分钟，完成后自动启动。',padding=(24,0)).pack()
     progress=ttk.Progressbar(window,mode='indeterminate',length=340)
     progress.pack(padx=24,pady=18);progress.start(12)
@@ -213,6 +287,10 @@ def get_selection(root=ROOT, *, resources=None, config_path=None):
     return selection(resources,runtime,manifest,config_path,recipe_id())
 
 
+def needs_preparation(selected):
+    return selected['mode'] != 'custom-trial' or bool(selected.get('degraded'))
+
+
 def _main(argv=None, automatic=None, *, notifications=None):
     def notify(title, text):
         if notifications is None:
@@ -226,7 +304,8 @@ def _main(argv=None, automatic=None, *, notifications=None):
     selected=get_selection()
     if args.official:
         resources=installed_resources()
-        selected.update(mode='official',engine=str(resources/'codex.exe'),reason='使用官方默认入口。')
+        selected=dict(mode='official',engine=str(resources/'codex.exe'),
+                      desktop=str(resources.parent/'ChatGPT.exe'),reason='使用官方默认入口。')
     processes=process_snapshot()
     existing=running_desktops(processes)
     status=dict(**selected,already_running=bool(existing),running_desktop_pids=[p['ProcessId'] for p in existing])
@@ -239,6 +318,9 @@ def _main(argv=None, automatic=None, *, notifications=None):
     if selected['mode']=='official' and not args.official:
         detail=(automatic or {}).get('reason') or selected['reason']
         notify('使用官方引擎',detail+'\n本次使用官方桌面，自定义重试暂未启用；已保存参数保留。')
+    elif selected.get('degraded') and not args.official:
+        notify('部分功能尚未适配','本次使用已验收的功能：'+profile_label(selected['profile'])+
+               '\n'+'\n'.join(selected.get('warnings',[])))
     if not args.official:
         taskbar('prepare')
     env=launch_environment(os.environ,selected)
@@ -256,13 +338,14 @@ def _main(argv=None, automatic=None, *, notifications=None):
             time.sleep(2)
             snapshot=process_snapshot()
             fresh_desktops={p['ProcessId'] for p in running_desktops(snapshot) if p['ProcessId'] not in before}
-            observed=[p for p in snapshot if p['ProcessId'] not in before and p['ParentProcessId'] in fresh_desktops
-                      and Path(p.get('ExecutablePath') or '').name.lower()=='codex.exe']
+            observed=[p for p in desktop_engines(snapshot,fresh_desktops) if p['ProcessId'] not in before]
             if observed:break
     except Exception as exc:
         # Launch already happened; never misreport a monitoring failure as failure to start.
         observation_error=str(exc)
-    selected_seen=any(Path(p['ExecutablePath']).resolve()==Path(selected['engine']).resolve() for p in observed)
+    selected_seen=any(Path(p['ExecutablePath']).resolve()==Path(selected['engine']).resolve()
+        and Path(p.get('ControllerEntryPath',p['ExecutablePath'])).resolve()==Path(selected.get('cli',selected['engine'])).resolve()
+        for p in observed)
     save_status('desktop-launch-observation.json',dict(**selected,selected_engine_seen=selected_seen,
                 processes=observed,observation_error=observation_error,
                 scope='Executable selection only; not a sandbox or account-feature test.'))
@@ -282,7 +365,7 @@ def main(argv=None):
     if not arguments:
         pointer = read_pointer(ROOT)
         if (pointer.get('enabled', True) is not False and pointer.get('runtime')
-                and get_selection()['mode'] != 'custom-trial'
+                and needs_preparation(get_selection())
                 and not running_desktops(process_snapshot())):
             manager = DesktopManager(ROOT)
             try:

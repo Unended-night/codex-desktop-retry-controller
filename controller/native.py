@@ -289,9 +289,9 @@ def replacements(data,p,error):
             for n,site in enumerate(s['sampling_sites']):
                 if 'returned_classifier' in site:
                     policy_entry=entry+len(code)
-                    code+=error_policy(dict(s,**site),p)
+                    code+=error_policy(dict(site,invalid_request=s['invalid_request']),p,address=policy_entry)
                     policy_patch=(site['offsets']['policy'],site['policy_size'],
-                                  jmp(site['policy'],policy_entry,b'\xe8'),f'model_outer_policy_{n}')
+                                  jmp(site['policy'],policy_entry,b'\xe9' if 'policy_present' in site else b'\xe8'),f'model_outer_policy_{n}')
                 else:
                     policy_patch=(site['offsets']['call'],5,jmp(site['call'],entry,b'\xe8'),f'model_outer_policy_{n}')
                 budget_entry=entry+len(code)
@@ -309,8 +309,8 @@ def replacements(data,p,error):
         for n,site in enumerate(s['compact']):
             if 'returned_classifier' in site:
                 policy_entry=entry+len(code)
-                code+=error_policy(dict(s,**site),p)
-                patches += [(site['policy_offset'],site['policy_size'],jmp(site['policy'],policy_entry,b'\xe8'),f'compact_delay_{n}'),
+                code+=error_policy(dict(site,invalid_request=s['invalid_request']),p,address=policy_entry)
+                patches += [(site['policy_offset'],site['policy_size'],jmp(site['policy'],policy_entry,b'\xe9' if 'policy_present' in site else b'\xe8'),f'compact_delay_{n}'),
                             (site['deadline'],site['deadline_size'],b'\xba'+struct.pack('<I',site['none_value']),f'compact_deadline_{n}')]
             else:
                 patches.append((site['call_offset'],5,jmp(site['call'],compact_entry,b'\xe8'),f'compact_delay_{n}'))

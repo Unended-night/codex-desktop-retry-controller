@@ -56,6 +56,12 @@ class StorageTests(unittest.TestCase):
         self.clean()
         self.assertFalse(self.old.exists())
 
+    def test_live_timeout_entry_protects_generation_before_engine_child_exists(self):
+        self.running = [self.old / 'codex-guard.exe']
+        self.clean(keep_history=False)
+        self.assertTrue(self.old.exists() and self.active.exists())
+        self.assertFalse(self.history.exists())
+
     def test_manual_clears_all_history_leaving_only_current(self):
         self.running = [self.active / 'codex.exe']
         report = self.clean(keep_history=False)

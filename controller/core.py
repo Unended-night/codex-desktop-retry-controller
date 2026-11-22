@@ -24,6 +24,7 @@ SUPPORTED_SHA256 = "8f0554ede25bbc5450921897c468b2e84635aa513c5017457997af095458
 SUPPORTED_SIZE = 321953584
 MAX_RETRIES = 1000000
 MAX_INTERVAL_MS = 60000
+MAX_HTTP_TIMEOUT_MS = 600000
 
 # All offsets refer to the exact SHA-256 above, not just a version string.
 PATCH_SITES = [
@@ -104,7 +105,8 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def profile(retries: int | str, interval_seconds: str, jitter: str = '0', *, unit: str = 's') -> dict:
+def profile(retries: int | str, interval_seconds: str, jitter: str = '0', *, unit: str = 's',
+            http_timeout_ms: int = 0, retry_enabled: bool = True) -> dict:
     try:
         if not re.fullmatch(r"[0-9]+", str(retries).strip()):
             raise ValueError
@@ -120,9 +122,17 @@ def profile(retries: int | str, interval_seconds: str, jitter: str = '0', *, uni
         ms, spread = values
         if not 0 <= count <= MAX_RETRIES or not 0 <= ms-spread <= ms+spread <= MAX_INTERVAL_MS:
             raise ValueError
+        if type(http_timeout_ms) is not int or not (http_timeout_ms == 0 or 1000 <= http_timeout_ms <= MAX_HTTP_TIMEOUT_MS):
+            raise ControllerError('HTTP 响应期限须为 1～600 秒；0 表示关闭。')
+        if type(retry_enabled) is not bool:
+            raise ControllerError('自定义重试开关须为布尔值。')
         result = {"max_retries": count, "interval_ms": ms}
         if spread:
             result['jitter_ms'] = spread
+        if http_timeout_ms:
+            result['http_timeout_ms'] = http_timeout_ms
+        if not retry_enabled:
+            result['retry_enabled'] = False
         return result
     except (ValueError, InvalidOperation, OverflowError):
         raise ControllerError("次数须为 0～1000000 的整数；时间精度为 1 毫秒，基础等待 ± 扰动须在 0～60000 毫秒内。") from None
@@ -132,13 +142,24 @@ def validate_profile(p: dict) -> dict:
     if (not isinstance(p, dict) or type(p.get("interval_ms")) is not int
             or type(p.get('jitter_ms', 0)) is not int):
         raise ControllerError("无效的重试设置。")
-    return profile(p.get("max_retries"), p['interval_ms'], p.get('jitter_ms', 0), unit='ms')
+    return profile(p.get("max_retries"), p['interval_ms'], p.get('jitter_ms', 0), unit='ms',
+                   http_timeout_ms=p.get('http_timeout_ms', 0), retry_enabled=p.get('retry_enabled', True))
+
+
+def retry_profile(p: dict) -> dict:
+    """Native settings only; an optional HTTP layer must not enter its receipt."""
+    result = validate_profile(p)
+    result.pop('http_timeout_ms', None)
+    return result
 
 
 def profile_label(p: dict) -> str:
-    text = f"{p['max_retries']} 次 / {p['interval_ms']/1000:g} 秒"
-    if p.get('jitter_ms', 0):
+    text = (f"{p['max_retries']} 次 / {p['interval_ms']/1000:g} 秒"
+            if p.get('retry_enabled', True) else '重试次数与等待使用原生设置')
+    if p.get('retry_enabled', True) and p.get('jitter_ms', 0):
         text += f"（随机扰动 ±{p['jitter_ms']} 毫秒）"
+    if p.get('http_timeout_ms'):
+        text += f"；HTTP 响应期限 {p['http_timeout_ms']/1000:g} 秒"
     return text
 
 
@@ -366,6 +387,8 @@ class Manager:
 
     def apply(self, path: Path, p: dict) -> dict:
         p = validate_profile(p)
+        if not p.get('retry_enabled', True) or p.get('http_timeout_ms'):
+            raise ControllerError('原生补丁接口只处理自定义重试；独立开关和 HTTP 超时请通过桌面控制器保存。')
         if self.verify_writes:
             self.verify(path)
         return self._change(path, p)

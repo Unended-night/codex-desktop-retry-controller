@@ -12,6 +12,9 @@
 !/desktop_processes.py
 !/desktop_shell.py
 !/windows_shell.py
+!/transport_*.py
+!/transport_shim.cs
+!/transport_startup.cjs
 !/repair_shortcut_icons.ps1
 !/启动控制器.cmd
 
@@ -29,6 +32,7 @@
 !/tests/fixtures/outlined-retry.json
 !/tests/fixtures/retry-scope.json
 !/tests/fixtures/returned-retry.json
+!/tests/fixtures/delegated-retry.json
 
 !/research/
 /research/*
@@ -50,6 +54,8 @@
 !/docs/ARCHITECTURE.md
 !/docs/MAINTENANCE.md
 !/docs/PUBLICATION.md
+!/docs/FAILED-ATTEMPT-2026-11-22.md
+!/docs/failed-http-timeout-2026-11-22.png
 
 # Defense in depth inside allowed directories.
 **/__pycache__/

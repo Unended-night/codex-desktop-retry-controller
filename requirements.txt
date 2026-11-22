@@ -2,3 +2,5 @@
 capstone==5.0.9
 pefile==2024.8.26
 tomli==2.2.1; python_version < "3.11"
+httpx==0.27.2
+h11==0.16.0

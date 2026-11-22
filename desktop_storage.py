@@ -13,7 +13,7 @@ from controller.core import ControllerError, atomic_json, now
 
 
 def process_paths():
-    names = ['codex.exe', 'codex-code-mode-host.exe', 'codex-command-runner.exe',
+    names = ['codex.exe', 'codex-guard.exe', 'codex-code-mode-host.exe', 'codex-command-runner.exe',
              'codex-windows-sandbox-setup.exe', 'rg.exe']
     query = ' OR '.join("Name = '%s'" % n for n in names)
     script = ('[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); '
@@ -113,7 +113,7 @@ def archive(root, target):
     checked_tree(root, base)
     key = '__'.join(target.relative_to(root).parts)
     report = {'source': str(target), 'archived_at': now(), 'files': {}}
-    for name in ('manifest.json', 'validation.json', 'candidate.json', 'gui-result.json',
+    for name in ('manifest.json', 'validation.json', 'http-validation.json', 'candidate.json', 'gui-result.json',
                  'completed.json', 'state/desktop-trial.json'):
         p = target / name
         if p.is_file():
